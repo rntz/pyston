@@ -523,7 +523,8 @@ private:
 
     InternedString nodeName(AST* node) {
         char buf[40];
-        snprintf(buf, 40, "#%p", node);
+        int bytes = snprintf(buf, 40, "#%p", node);
+        assert(bytes < 40); // double-check
 // Uncomment this line to check to make sure we never reuse the same nodeName() accidentally.
 // This check is potentially too expensive for even debug mode, since it never frees any memory.
 // #define VALIDATE_FAKE_NAMES
@@ -540,13 +541,15 @@ private:
 
     InternedString nodeName(AST* node, const std::string& suffix) {
         char buf[50];
-        snprintf(buf, 50, "#%p_%s", node, suffix.c_str());
+        int bytes = snprintf(buf, 50, "#%p_%s", node, suffix.c_str());
+        assert(bytes < 50); // double-check
         return internString(std::string(buf));
     }
 
     InternedString nodeName(AST* node, const std::string& suffix, int idx) {
         char buf[50];
-        snprintf(buf, 50, "#%p_%s_%d", node, suffix.c_str(), idx);
+        int bytes = snprintf(buf, 50, "#%p_%s_%d", node, suffix.c_str(), idx);
+        assert(bytes < 50); // double-check
         return internString(std::string(buf));
     }
 
