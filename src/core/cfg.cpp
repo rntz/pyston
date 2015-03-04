@@ -58,6 +58,9 @@ static const std::string RETURN_NAME("#rtnval");
 class CFGVisitor : public ASTVisitor {
 private:
     SourceInfo* source;
+    // `root_type' is the type of the root of the AST tree that we are turning
+    // into a CFG. Used when we find a "return" to check that we're inside a
+    // function (otherwise we SyntaxError).
     AST_TYPE::AST_TYPE root_type;
     FutureFlags future_flags;
     CFG* cfg;
@@ -1015,6 +1018,11 @@ private:
         return makeName(node_name, AST_TYPE::Load, node->lineno);
     }
 
+    // Flattens a nested expression into a flat one, emitting instructions &
+    // generating temporary variables as needed.
+    //
+    // If `wrap_with_assign` is true, it will always return a temporary
+    // variable.
     AST_expr* remapExpr(AST_expr* node, bool wrap_with_assign = true) {
         if (node == NULL)
             return NULL;
@@ -1100,6 +1108,7 @@ private:
                 RELEASE_ASSERT(0, "%d", node->type);
         }
 
+        // this is the part that actually generates temporaries & assigns to them.
         if (wrap_with_assign && (rtn->type != AST_TYPE::Name || ast_cast<AST_Name>(rtn)->id.str()[0] != '#')) {
             InternedString name = nodeName(node);
             pushAssign(name, rtn);
@@ -1637,6 +1646,8 @@ public:
     }
 
     bool visit_return(AST_Return* node) override {
+        // returns are allowed in functions (of course), and also in eval("...") strings - basically, eval strings get
+        // an implicit `return'. root_type is AST_TYPE::Expression when we're compiling an eval string.
         if (root_type != AST_TYPE::FunctionDef && root_type != AST_TYPE::Lambda && root_type != AST_TYPE::Expression) {
             raiseExcHelper(SyntaxError, "'return' outside function");
         }
