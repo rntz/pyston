@@ -199,8 +199,7 @@ private:
 
                 pushAssign(internString(RETURN_NAME), value);
 
-                AST_Jump* j = makeJump();
-                j->target = region.return_dest;
+                AST_Jump* j = makeJump(region.return_dest);
                 curblock->connectTo(region.return_dest);
                 push_back(j);
                 curblock = NULL;
@@ -224,8 +223,7 @@ private:
                     cont.did_why |= (1 << Why::CONTINUE);
                 }
 
-                AST_Jump* j = makeJump();
-                j->target = region.continue_dest;
+                AST_Jump* j = makeJump(region.continue_dest);
                 curblock->connectTo(region.continue_dest, true);
                 push_back(j);
                 curblock = NULL;
@@ -244,8 +242,7 @@ private:
                     cont.did_why |= (1 << Why::BREAK);
                 }
 
-                AST_Jump* j = makeJump();
-                j->target = region.break_dest;
+                AST_Jump* j = makeJump(region.break_dest);
                 curblock->connectTo(region.break_dest, true);
                 push_back(j);
                 curblock = NULL;
@@ -422,8 +419,9 @@ private:
         return node;
     }
 
-    AST_Jump* makeJump() {
+    AST_Jump* makeJump(CFGBlock* target) {
         AST_Jump* rtn = new AST_Jump();
+        rtn->target = target;
         return rtn;
     }
 
@@ -1796,9 +1794,8 @@ public:
         CFGBlock* test_block = cfg->addBlock();
         test_block->info = "while_test";
 
-        AST_Jump* j = makeJump();
+        AST_Jump* j = makeJump(test_block);
         push_back(j);
-        j->target = test_block;
         curblock->connectTo(test_block);
 
         curblock = test_block;
@@ -1822,9 +1819,8 @@ public:
             node->body[i]->accept(this);
         }
         if (curblock) {
-            AST_Jump* jbody = makeJump();
+            AST_Jump* jbody = makeJump(test_block);
             push_back(jbody);
-            jbody->target = test_block;
             curblock->connectTo(test_block, true);
         }
         popContinuation();
@@ -1838,9 +1834,8 @@ public:
             node->orelse[i]->accept(this);
         }
         if (curblock) {
-            AST_Jump* jend = makeJump();
+            AST_Jump* jend = makeJump(end);
             push_back(jend);
-            jend->target = end;
             curblock->connectTo(end);
         }
         curblock = end;
@@ -1875,8 +1870,7 @@ public:
             = makeLoadAttribute(makeName(itername, AST_TYPE::Load, node->lineno), internString("next"), true);
 
         CFGBlock* test_block = cfg->addBlock();
-        AST_Jump* jump_to_test = makeJump();
-        jump_to_test->target = test_block;
+        AST_Jump* jump_to_test = makeJump(test_block);
         push_back(jump_to_test);
         curblock->connectTo(test_block);
         curblock = test_block;
@@ -1899,14 +1893,12 @@ public:
         curblock = test_true;
 
         // TODO simplify the breaking of these crit edges?
-        AST_Jump* test_true_jump = makeJump();
-        test_true_jump->target = loop_block;
+        AST_Jump* test_true_jump = makeJump(loop_block);
         push_back(test_true_jump);
         test_true->connectTo(loop_block);
 
         curblock = test_false;
-        AST_Jump* test_false_jump = makeJump();
-        test_false_jump->target = else_block;
+        AST_Jump* test_false_jump = makeJump(else_block);
         push_back(test_false_jump);
         test_false->connectTo(else_block);
 
@@ -1935,14 +1927,12 @@ public:
             curblock->connectTo(end_false);
 
             curblock = end_true;
-            AST_Jump* end_true_jump = makeJump();
-            end_true_jump->target = loop_block;
+            AST_Jump* end_true_jump = makeJump(loop_block);
             push_back(end_true_jump);
             end_true->connectTo(loop_block, true);
 
             curblock = end_false;
-            AST_Jump* end_false_jump = makeJump();
-            end_false_jump->target = else_block;
+            AST_Jump* end_false_jump = makeJump(else_block);
             push_back(end_false_jump);
             end_false->connectTo(else_block);
         }
@@ -1954,9 +1944,8 @@ public:
             node->orelse[i]->accept(this);
         }
         if (curblock) {
-            AST_Jump* else_jump = makeJump();
+            AST_Jump* else_jump = makeJump(end_block);
             push_back(else_jump);
-            else_jump->target = end_block;
             curblock->connectTo(end_block);
         }
 
