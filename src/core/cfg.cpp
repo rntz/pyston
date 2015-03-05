@@ -56,31 +56,7 @@ void CFGBlock::unconnectFrom(CFGBlock* successor) {
 static const std::string RETURN_NAME("#rtnval");
 
 class CFGVisitor : public ASTVisitor {
-private:
-    SourceInfo* source;
-    // `root_type' is the type of the root of the AST tree that we are turning
-    // into a CFG. Used when we find a "return" to check that we're inside a
-    // function (otherwise we SyntaxError).
-    AST_TYPE::AST_TYPE root_type;
-    FutureFlags future_flags;
-    CFG* cfg;
-    CFGBlock* curblock;
-    ScopingAnalysis* scoping_analysis;
-
-public:
-    CFGVisitor(SourceInfo* source, AST_TYPE::AST_TYPE root_type, FutureFlags future_flags,
-               ScopingAnalysis* scoping_analysis, CFG* cfg)
-        : source(source), root_type(root_type), future_flags(future_flags), cfg(cfg),
-          scoping_analysis(scoping_analysis) {
-        curblock = cfg->addBlock();
-        curblock->info = "entry";
-    }
-
-    ~CFGVisitor() {
-        assert(regions.size() == 0);
-        assert(exc_handlers.size() == 0);
-    }
-
+    // ---------- Types ----------
 private:
     enum Why : int8_t {
         FALLTHROUGH,
@@ -103,6 +79,41 @@ private:
               did_why(0), why_name(why_name) {}
     };
 
+    struct ExcBlockInfo {
+        CFGBlock* exc_dest;
+        InternedString exc_type_name, exc_value_name, exc_traceback_name;
+    };
+
+    // ---------- Member fields ----------
+private:
+    SourceInfo* source;
+    // `root_type' is the type of the root of the AST tree that we are turning
+    // into a CFG. Used when we find a "return" to check that we're inside a
+    // function (otherwise we SyntaxError).
+    AST_TYPE::AST_TYPE root_type;
+    FutureFlags future_flags;
+    CFG* cfg;
+    CFGBlock* curblock;
+    ScopingAnalysis* scoping_analysis;
+    std::vector<RegionInfo> regions;
+    std::vector<ExcBlockInfo> exc_handlers;
+
+public:
+    CFGVisitor(SourceInfo* source, AST_TYPE::AST_TYPE root_type, FutureFlags future_flags,
+               ScopingAnalysis* scoping_analysis, CFG* cfg)
+        : source(source), root_type(root_type), future_flags(future_flags), cfg(cfg),
+          scoping_analysis(scoping_analysis) {
+        curblock = cfg->addBlock();
+        curblock->info = "entry";
+    }
+
+    ~CFGVisitor() {
+        assert(regions.size() == 0);
+        assert(exc_handlers.size() == 0);
+    }
+
+    // ---------- private methods ----------
+private:
     template <typename T> InternedString internString(T&& s) {
         return source->getInternedStrings().get(std::forward<T>(s));
     }
@@ -111,14 +122,6 @@ private:
         AST_Name* name = new AST_Name(id, ctx_type, lineno, col_offset);
         return name;
     }
-
-    std::vector<RegionInfo> regions;
-
-    struct ExcBlockInfo {
-        CFGBlock* exc_dest;
-        InternedString exc_type_name, exc_value_name, exc_traceback_name;
-    };
-    std::vector<ExcBlockInfo> exc_handlers;
 
     void pushLoopRegion(CFGBlock* continue_dest, CFGBlock* break_dest) {
         assert(continue_dest
@@ -518,8 +521,6 @@ private:
         stmt->col_offset = expr->col_offset;
         return stmt;
     }
-
-
 
     InternedString nodeName(AST* node) {
         char buf[40];
@@ -1121,6 +1122,7 @@ private:
         }
     }
 
+    // ---------- public methods ----------
 public:
     void push_back(AST_stmt* node) {
         assert(node->type != AST_TYPE::Invoke);
