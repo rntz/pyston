@@ -36,7 +36,8 @@ void CFGBlock::connectTo(CFGBlock* successor, bool allow_backedge) {
 
     if (!allow_backedge) {
         assert(this->idx >= 0);
-        ASSERT(successor->idx == -1 || successor->idx > this->idx, "edge from %d to %d", this->idx, successor->idx);
+        ASSERT(successor->idx == -1 || successor->idx > this->idx, "edge from %d (%s) to %d (%s)", this->idx,
+               this->info, successor->idx, successor->info);
     }
     // assert(successors.count(successor) == 0);
     // assert(successor->predecessors.count(this) == 0);
@@ -183,11 +184,6 @@ private:
     }
 
     void popContinuation() { continuations.pop_back(); }
-
-    // XXX(rntz) get rid of this
-    void pushReturnContinuation(CFGBlock* return_dest) {
-        continuations.emplace_back(nullptr, nullptr, return_dest, false, internString(""));
-    }
 
     void doReturn(AST_expr* value) {
         assert(value);
@@ -402,6 +398,7 @@ private:
         curblock = nullptr;
     }
 
+    // NB. can generate blocks, because callNonzero can
     AST_Branch* makeBranch(AST_expr* test) {
         AST_Branch* rtn = new AST_Branch();
         rtn->test = callNonzero(test);
@@ -410,8 +407,11 @@ private:
         return rtn;
     }
 
-    // NB. this doesn't allow these branches to be backedges, because this hasn't yet been necessary.
+    // NB. this can (but usually doesn't) generate new blocks, which is why we require `iftrue' and `iffalse' to be
+    // deferred, to avoid heisenbugs. of course, this doesn't allow these branches to be backedges, but that hasn't yet
+    // been necessary.
     void pushBranch(AST_expr* test, CFGBlock* iftrue, CFGBlock* iffalse) {
+        assert(iftrue->idx == -1 && iffalse->idx == -1);
         AST_Branch* branch = makeBranch(test);
         branch->iftrue = iftrue;
         branch->iffalse = iffalse;
@@ -1133,6 +1133,15 @@ private:
         } else {
             return rtn;
         }
+    }
+
+    // helper for visit_{tryfinally,with}
+    CFGBlock* makeFinallyCont(Why reason, AST_expr* whyexpr, CFGBlock* then_block) {
+        CFGBlock* otherwise = cfg->addDeferredBlock();
+        otherwise->info = "finally_otherwise";
+        pushBranch(makeCompare(AST_TYPE::Eq, whyexpr, makeNum(reason)), then_block, otherwise);
+        cfg->placeBlock(otherwise);
+        return otherwise;
     }
 
     // ---------- public methods ----------
@@ -2069,22 +2078,10 @@ public:
             // TODO: these 4 cases are pretty copy-pasted from each other:
             // FIXME(rntz): there are only three cases here. is there a bug here?
             if (did_why & (1 << Why::RETURN)) {
-                CFGBlock* doreturn = cfg->addBlock();
-                CFGBlock* otherwise = cfg->addBlock();
+                CFGBlock* doreturn = cfg->addDeferredBlock();
+                CFGBlock* otherwise = makeFinallyCont(Why::RETURN, makeLoad(exc_why_name, node), doreturn);
 
-                AST_Compare* compare = new AST_Compare();
-                compare->ops.push_back(AST_TYPE::Eq);
-                compare->left = makeLoad(exc_why_name, node);
-                compare->comparators.push_back(makeNum(Why::RETURN));
-
-                AST_Branch* br = new AST_Branch();
-                br->test = callNonzero(compare);
-                br->iftrue = doreturn;
-                br->iffalse = otherwise;
-                curblock->connectTo(doreturn);
-                curblock->connectTo(otherwise);
-                push_back(br);
-
+                cfg->placeBlock(doreturn);
                 curblock = doreturn;
                 doReturn(makeLoad(internString(RETURN_NAME), node));
 
@@ -2092,68 +2089,31 @@ public:
             }
 
             if (did_why & (1 << Why::BREAK)) {
-                CFGBlock* doreturn = cfg->addBlock();
-                CFGBlock* otherwise = cfg->addBlock();
+                CFGBlock* dobreak = cfg->addDeferredBlock();
+                CFGBlock* otherwise = makeFinallyCont(Why::BREAK, makeLoad(exc_why_name, node), dobreak);
 
-                AST_Compare* compare = new AST_Compare();
-                compare->ops.push_back(AST_TYPE::Eq);
-                compare->left = makeLoad(exc_why_name, node);
-                compare->comparators.push_back(makeNum(Why::BREAK));
-
-                AST_Branch* br = new AST_Branch();
-                br->test = callNonzero(compare);
-                br->iftrue = doreturn;
-                br->iffalse = otherwise;
-                curblock->connectTo(doreturn);
-                curblock->connectTo(otherwise);
-                push_back(br);
-
-                curblock = doreturn;
+                cfg->placeBlock(dobreak);
+                curblock = dobreak;
                 doBreak();
 
                 curblock = otherwise;
             }
 
             if (did_why & (1 << Why::CONTINUE)) {
-                CFGBlock* doreturn = cfg->addBlock();
-                CFGBlock* otherwise = cfg->addBlock();
+                CFGBlock* docontinue = cfg->addDeferredBlock();
+                CFGBlock* otherwise = makeFinallyCont(Why::RETURN, makeLoad(exc_why_name, node), docontinue);
 
-                AST_Compare* compare = new AST_Compare();
-                compare->ops.push_back(AST_TYPE::Eq);
-                compare->left = makeLoad(exc_why_name, node);
-                compare->comparators.push_back(makeNum(Why::CONTINUE));
-
-                AST_Branch* br = new AST_Branch();
-                br->test = callNonzero(compare);
-                br->iftrue = doreturn;
-                br->iffalse = otherwise;
-                curblock->connectTo(doreturn);
-                curblock->connectTo(otherwise);
-                push_back(br);
-
-                curblock = doreturn;
+                cfg->placeBlock(docontinue);
+                curblock = docontinue;
                 doContinue();
 
                 curblock = otherwise;
             }
 
-            AST_Compare* compare = new AST_Compare();
-            compare->ops.push_back(AST_TYPE::Eq);
-            compare->left = makeLoad(exc_why_name, node);
-            compare->comparators.push_back(makeNum(Why::EXCEPTION));
+            CFGBlock* reraise = cfg->addDeferredBlock();
+            CFGBlock* noexc = makeFinallyCont(Why::EXCEPTION, makeLoad(exc_why_name, node), reraise);
 
-            AST_Branch* br = new AST_Branch();
-            br->test = callNonzero(compare);
-
-            CFGBlock* reraise = cfg->addBlock();
-            CFGBlock* noexc = cfg->addBlock();
-
-            br->iftrue = reraise;
-            br->iffalse = noexc;
-            curblock->connectTo(reraise);
-            curblock->connectTo(noexc);
-            push_back(br);
-
+            cfg->placeBlock(reraise);
             curblock = reraise;
             AST_Raise* raise = new AST_Raise();
             raise->arg0 = makeLoad(exc_type_name, node);
@@ -2168,105 +2128,197 @@ public:
     }
 
     bool visit_with(AST_With* node) override {
-        char ctxmgrname_buf[80];
-        snprintf(ctxmgrname_buf, 80, "#ctxmgr_%p", node);
-        InternedString ctxmgrname = internString(ctxmgrname_buf);
-        char exitname_buf[80];
-        snprintf(exitname_buf, 80, "#exit_%p", node);
-        InternedString exitname = internString(exitname_buf);
+        // see https://www.python.org/dev/peps/pep-0343/
+        // section "Specification: the 'with' Statement"
+        // which contains pseudocode for what this implements:
+        //
+        // mgr = (EXPR)
+        // exit = type(mgr).__exit__            # not calling it yet
+        // value = type(mgr).__enter__(mgr)
+        // exc = True
+        // try:
+        //     VAR = value
+        //     BLOCK
+        // except:
+        //     exc = False
+        //     if not exit(mgr, *sys.exc_info()):
+        //         raise
+        // finally:
+        //     if exc:
+        //         exit(mgr, None, None, None)
+        //
+        InternedString ctxmgrname = nodeName(node, "ctxmgr");
+        InternedString exitname = nodeName(node, "exit");
+        InternedString whyname = nodeName(node, "why");
+        InternedString exc_type_name = nodeName(node, "exc_type");
+        InternedString exc_value_name = nodeName(node, "exc_value");
+        InternedString exc_traceback_name = nodeName(node, "exc_traceback");
         InternedString nonename = internString("None");
+        CFGBlock* exit_block = cfg->addDeferredBlock();
+        exit_block->info = "with_exit";
 
         pushAssign(ctxmgrname, remapExpr(node->context_expr));
 
-        AST_expr* enter
-            = makeLoadAttribute(makeName(ctxmgrname, AST_TYPE::Load, node->lineno), internString("__enter__"), true);
-        AST_expr* exit
-            = makeLoadAttribute(makeName(ctxmgrname, AST_TYPE::Load, node->lineno), internString("__exit__"), true);
+        // TODO(rntz): for some reason this acts like it's "mgr.__exit__" instead
+        AST_expr* exit = makeLoadAttribute(makeLoad(ctxmgrname, node), internString("__exit__"), true);
         pushAssign(exitname, exit);
+
+        AST_expr* enter = makeLoadAttribute(makeLoad(ctxmgrname, node), internString("__enter__"), true);
         enter = remapExpr(makeCall(enter));
-
-        if (node->optional_vars) {
+        if (node->optional_vars)
             pushAssign(node->optional_vars, enter);
-        } else {
+        else
             push_back(makeExpr(enter));
-        }
 
-        CFGBlock* continue_dest = NULL, * break_dest = NULL;
-        if (continuations.size()) {
-            continue_dest = cfg->addDeferredBlock();
-            continue_dest->info = "with_continue";
-            break_dest = cfg->addDeferredBlock();
-            break_dest->info = "with_break";
+        // push continuations
+        CFGBlock* finally_block = cfg->addDeferredBlock();
+        finally_block->info = "with_finally";
+        pushFinallyContinuation(finally_block, whyname);
 
-            pushLoopContinuation(continue_dest, break_dest);
-        }
-
-        CFGBlock* return_dest = cfg->addDeferredBlock();
-        return_dest->info = "with_return";
-        pushReturnContinuation(return_dest);
+        CFGBlock* exc_block = cfg->addDeferredBlock();
+        exc_block->info = "with_exc";
+        exc_handlers.push_back({ exc_block, exc_type_name, exc_value_name, exc_traceback_name });
 
         for (int i = 0; i < node->body.size(); i++) {
             node->body[i]->accept(this);
         }
 
-        popContinuation(); // for the retrun
+        exc_handlers.pop_back();
+        int finally_did_why = continuations.back().did_why;
+        popContinuation();
 
-        AST_Call* exit_call = makeCall(makeName(exitname, AST_TYPE::Load, node->lineno));
-        exit_call->args.push_back(makeName(nonename, AST_TYPE::Load, node->lineno));
-        exit_call->args.push_back(makeName(nonename, AST_TYPE::Load, node->lineno));
-        exit_call->args.push_back(makeName(nonename, AST_TYPE::Load, node->lineno));
-        push_back(makeExpr(exit_call));
-
-        CFGBlock* orig_ending_block = curblock;
-
-        if (continue_dest) {
-            popContinuation(); // for the loop continuation
-            if (continue_dest->predecessors.size() == 0) {
-                delete continue_dest;
-            } else {
-                curblock = continue_dest;
-
-                AST_Call* exit_call = makeCall(makeLoad(exitname, node));
-                exit_call->args.push_back(makeLoad(nonename, node));
-                exit_call->args.push_back(makeLoad(nonename, node));
-                exit_call->args.push_back(makeLoad(nonename, node));
-                push_back(makeExpr(exit_call));
-
-                cfg->placeBlock(continue_dest);
-                doContinue();
-            }
-
-            if (break_dest->predecessors.size() == 0) {
-                delete break_dest;
-            } else {
-                curblock = break_dest;
-
-                AST_Call* exit_call = makeCall(makeLoad(exitname, node));
-                exit_call->args.push_back(makeLoad(nonename, node));
-                exit_call->args.push_back(makeLoad(nonename, node));
-                exit_call->args.push_back(makeLoad(nonename, node));
-                push_back(makeExpr(exit_call));
-
-                cfg->placeBlock(break_dest);
-                doBreak();
-            }
-            curblock = orig_ending_block;
+        if (curblock) {
+            // The try-suite finished as normal; jump to the finally block.
+            pushAssign(whyname, makeNum(Why::FALLTHROUGH));
+            pushJump(finally_block);
         }
 
-        if (return_dest->predecessors.size() == 0) {
-            delete return_dest;
+        // This tells us whether our exit_block will have multiple incoming edges (one from exc_block, one from
+        // finally_block) or not (if exc_block and/or finally_block is unneeded, or if finally_block doesn't jump to
+        // exit_block because it's never entered except via continue, break, and/or return). If exit_block has multiple
+        // incoming edges, then anybody *branching* into it (rather than jumping directly) needs to do so through a
+        // "trampoline" block to avoid critical edges.
+        // bool exit_multi_incoming = exc_block->predecessors.size() && (finally_did_why & (1 << Why::FALLTHROUGH));
+        bool exit_multi_incoming = true; // FIXME FIXME FIXME(rntz)
+
+        // The exception-handling block
+        if (exc_block->predecessors.size() == 0) {
+            // TODO(rntz): test for this case
+            delete exc_block;
         } else {
-            cfg->placeBlock(return_dest);
-            curblock = return_dest;
+            cfg->placeBlock(exc_block);
+            curblock = exc_block;
 
-            AST_Call* exit_call = makeCall(makeLoad(exitname, node));
-            exit_call->args.push_back(makeLoad(nonename, node));
-            exit_call->args.push_back(makeLoad(nonename, node));
-            exit_call->args.push_back(makeLoad(nonename, node));
-            push_back(makeExpr(exit_call));
+            // call the context-manager's exit method
+            InternedString suppressname = nodeName(node, "suppress");
+            pushAssign(suppressname, makeCall(makeLoad(exitname, node), makeLoad(exc_type_name, node),
+                                              makeLoad(exc_value_name, node), makeLoad(exc_traceback_name, node)));
 
-            doReturn(makeLoad(internString(RETURN_NAME), node));
-            curblock = orig_ending_block;
+            // if it returns true, suppress the error and go to our exit block
+            CFGBlock* reraise_block = cfg->addDeferredBlock();
+            reraise_block->info = "with_reraise";
+            CFGBlock* exiter = exit_multi_incoming ? cfg->addDeferredBlock() : exit_block;
+            pushBranch(makeLoad(suppressname, node), exiter, reraise_block);
+
+            if (exiter != exit_block) { // need to break critical edge
+                exiter->info = "with_exiter";
+                cfg->placeBlock(exiter);
+                curblock = exiter;
+                pushJump(exit_block);
+            }
+
+            // otherwise, reraise the exception
+            cfg->placeBlock(reraise_block);
+            curblock = reraise_block;
+            auto raise = new AST_Raise();
+            raise->arg0 = makeLoad(exc_type_name, node);
+            raise->arg1 = makeLoad(exc_value_name, node);
+            raise->arg2 = makeLoad(exc_traceback_name, node);
+            push_back(raise);
+        }
+
+        // The finally block
+        if (finally_block->predecessors.size() == 0) {
+            // TODO(rntz): test for this case
+            delete finally_block;
+        } else {
+            cfg->placeBlock(finally_block);
+            curblock = finally_block;
+            // call the context-manager's exit method, ignoring result
+            push_back(makeExpr(makeCall(makeLoad(exitname, node), makeLoad(nonename, node), makeLoad(nonename, node),
+                                        makeLoad(nonename, node))));
+
+            // for each reason which we might enter this block, exit in the
+            // appropriate manner...
+            // if (finally_did_why & (1 << Why::FALLTHROUGH)) {
+            //     curblock = makeFinallyCont(Why::FALLTHROUGH, makeLoad(whyname, node), exit_block);
+            // }
+
+            if (finally_did_why & (1 << Why::RETURN)) {
+                CFGBlock* doreturn = cfg->addDeferredBlock();
+                doreturn->info = "with_do_return";
+                CFGBlock* otherwise = makeFinallyCont(Why::RETURN, makeLoad(whyname, node), doreturn);
+
+                // TODO(rntz): doesn't this unnecessarily reassign RETURN_NAME?
+                // and similarly for the other cases here?
+                cfg->placeBlock(doreturn);
+                curblock = doreturn;
+                doReturn(makeLoad(internString(RETURN_NAME), node));
+
+                curblock = otherwise;
+                assert(curblock->info == "finally_otherwise");
+            }
+
+            if (finally_did_why & (1 << Why::BREAK)) {
+                CFGBlock* dobreak = cfg->addDeferredBlock();
+                dobreak->info = "with_do_break";
+                CFGBlock* otherwise = makeFinallyCont(Why::BREAK, makeLoad(whyname, node), dobreak);
+
+                cfg->placeBlock(dobreak);
+                curblock = dobreak;
+                doBreak();
+
+                curblock = otherwise;
+                assert(curblock->info == "finally_otherwise");
+            }
+
+            if (finally_did_why & (1 << Why::CONTINUE)) {
+                CFGBlock* docontinue = cfg->addDeferredBlock();
+                docontinue->info = "with_do_continue";
+                CFGBlock* otherwise = makeFinallyCont(Why::CONTINUE, makeLoad(whyname, node), docontinue);
+
+                cfg->placeBlock(docontinue);
+                curblock = docontinue;
+                doContinue();
+                curblock = otherwise;
+
+                assert(curblock->info == "finally_otherwise");
+            }
+
+            // at this point the block we're in is unreachable.
+            // TODO(rntz): shouldn't we mark this somehow?
+            //
+            // TODO(rntz): some smart strategy which employs knowledge about how many ways we can enter this block to
+            // emit less comparisons above.
+            if (exit_multi_incoming) {
+                // break critical edge
+                CFGBlock* blk = cfg->addBlock();
+                blk->info = "with_break_critical_edge_to_exit";
+                pushJump(blk);
+                curblock = blk;
+                pushJump(exit_block);
+            } else
+                pushJump(exit_block); // FIXME
+        }
+
+        if (exit_block->predecessors.size() == 0) {
+            // FIXME(rntz): does this ever happen?
+            // make a test for it!
+            delete exit_block;
+            curblock = nullptr;
+        } else {
+            cfg->placeBlock(exit_block);
+            curblock = exit_block;
         }
 
         return true;
