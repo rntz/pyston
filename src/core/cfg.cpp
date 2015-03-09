@@ -58,29 +58,76 @@ static const std::string RETURN_NAME("#rtnval");
 class CFGVisitor : public ASTVisitor {
     // ---------- Types ----------
 private:
+    // The various reasons why a `finally' block (or similar, eg. a `with' exit block) might get entered.
     enum Why : int8_t {
-        FALLTHROUGH,
+        FALLTHROUGH, // i.e. normal control flow
         CONTINUE,
         BREAK,
         RETURN,
         EXCEPTION,
     };
 
-    // My first thought is to call this BlockInfo, but this is separate from the idea of cfg blocks.
-    struct RegionInfo {
+    /* Explanation of ContInfo and ExcBlockInfo:
+     *
+     * While generating the CFG, we need to know what to do if we:
+     * 1. hit a `continue'
+     * 2. hit a `break'
+     * 3. hit a `return'
+     * 4. raise an exception
+     *
+     * We call these "continuations", because they're what we "continue on to" after these conditions occur.
+     *
+     * Various control flow constructs affect each of these:
+     * - `for' and `while' affect (1-2).
+     * - `try/except' affects (4).
+     * - `try/finally' and `with' affect all four.
+     *
+     * Each of these take effect only within some chunk of code. So, notionally, we keep a stack for each of (1-4) whose
+     * _top_ value says what to do if that condition occurs. The top of the continue-stack points to the block to jump
+     * to if we hit a `continue', etc.
+     *
+     * For example, when we enter a loop, we push a pointer to the head of the loop onto the continue-stack, and a
+     * pointer to the code after the loop onto the break-stack. When we visit a `break' in the loop body, we emit a jump
+     * to the top of the break-stack, which is the end of the loop. After we finish visiting the loop body, we pop the
+     * break- & continue-stacks, restoring our old state (maybe we were inside another loop, for example).
+     *
+     * It's more complicated in practice, because:
+     *
+     * 1. When we jump to a `finally' block, we must tell it *why* we jumped to it. After the `finally' block finishes,
+     *    it uses this info to resume what we were doing before we entered it (returning, raising an exception, etc).
+     *
+     * 2. When we jump to a `except' block, we must record three pieces of information about the exception (its type,
+     *    value, and traceback).
+     *
+     * So instead of four stacks of block pointers, instead we have two stacks:
+     * - `continuations', a stack of ContInfos, for `continue', `break', and `return'
+     * - `exc_handlers', a stack of ExcBlockInfos, for exceptions
+     *
+     * Read the comments in ContInfo & ExcBlockInfo for more information.
+     */
+    struct ContInfo {
+        // where to jump to if a continue, break, or return happens respectively
         CFGBlock* continue_dest, *break_dest, *return_dest;
+        // true if this continuation needs to know the reason why we entered it. `finally' blocks use this info to
+        // determine how to resume execution after they finish.
         bool say_why;
+        // bit-vector tracking all reasons Why we ever might enter this continuation. is only updated/used if `say_why'
+        // is true. when we emit a jump to this continuation for reason w, we set the bit (did_why & (1 << w)). this is
+        // used when emitting `finally' blocks to determine which continuation-cases to emit.
         int did_why;
+        // name of the variable to store the reason Why we jumped in.
         InternedString why_name;
 
-        RegionInfo(CFGBlock* continue_dest, CFGBlock* break_dest, CFGBlock* return_dest, bool say_why,
-                   InternedString why_name)
+        ContInfo(CFGBlock* continue_dest, CFGBlock* break_dest, CFGBlock* return_dest, bool say_why,
+                 InternedString why_name)
             : continue_dest(continue_dest), break_dest(break_dest), return_dest(return_dest), say_why(say_why),
               did_why(0), why_name(why_name) {}
     };
 
     struct ExcBlockInfo {
+        // where to jump in case of an exception
         CFGBlock* exc_dest;
+        // variable names to store the exception (type, value, traceback) in
         InternedString exc_type_name, exc_value_name, exc_traceback_name;
     };
 
@@ -95,7 +142,7 @@ private:
     CFG* cfg;
     CFGBlock* curblock;
     ScopingAnalysis* scoping_analysis;
-    std::vector<RegionInfo> regions;
+    std::vector<ContInfo> continuations;
     std::vector<ExcBlockInfo> exc_handlers;
 
 public:
@@ -108,7 +155,7 @@ public:
     }
 
     ~CFGVisitor() {
-        assert(regions.size() == 0);
+        assert(continuations.size() == 0);
         assert(exc_handlers.size() == 0);
     }
 
@@ -123,31 +170,31 @@ private:
         return name;
     }
 
-    void pushLoopRegion(CFGBlock* continue_dest, CFGBlock* break_dest) {
+    void pushLoopContinuation(CFGBlock* continue_dest, CFGBlock* break_dest) {
         assert(continue_dest
                != break_dest); // I guess this doesn't have to be true, but validates passing say_why=false
-        regions.emplace_back(continue_dest, break_dest, nullptr, false, internString(""));
+        continuations.emplace_back(continue_dest, break_dest, nullptr, false, internString(""));
     }
 
-    void pushFinallyRegion(CFGBlock* finally_block, InternedString why_name) {
-        regions.emplace_back(finally_block, finally_block, finally_block, true, why_name);
+    void pushFinallyContinuation(CFGBlock* finally_block, InternedString why_name) {
+        continuations.emplace_back(finally_block, finally_block, finally_block, true, why_name);
     }
 
-    void popRegion() { regions.pop_back(); }
+    void popContinuation() { continuations.pop_back(); }
 
     // XXX get rid of this
-    void pushReturnRegion(CFGBlock* return_dest) {
-        regions.emplace_back(nullptr, nullptr, return_dest, false, internString(""));
+    void pushReturnContinuation(CFGBlock* return_dest) {
+        continuations.emplace_back(nullptr, nullptr, return_dest, false, internString(""));
     }
 
     void doReturn(AST_expr* value) {
         assert(value);
 
-        for (auto& region : llvm::make_range(regions.rbegin(), regions.rend())) {
-            if (region.return_dest) {
-                if (region.say_why) {
-                    pushAssign(region.why_name, makeNum(Why::RETURN));
-                    region.did_why |= (1 << Why::RETURN);
+        for (auto& cont : llvm::make_range(continuations.rbegin(), continuations.rend())) {
+            if (cont.return_dest) {
+                if (cont.say_why) {
+                    pushAssign(cont.why_name, makeNum(Why::RETURN));
+                    cont.did_why |= (1 << Why::RETURN);
                 }
 
                 pushAssign(internString(RETURN_NAME), value);
@@ -170,11 +217,11 @@ private:
     }
 
     void doContinue() {
-        for (auto& region : llvm::make_range(regions.rbegin(), regions.rend())) {
-            if (region.continue_dest) {
-                if (region.say_why) {
-                    pushAssign(region.why_name, makeNum(Why::CONTINUE));
-                    region.did_why |= (1 << Why::CONTINUE);
+        for (auto& cont : llvm::make_range(continuations.rbegin(), continuations.rend())) {
+            if (cont.continue_dest) {
+                if (cont.say_why) {
+                    pushAssign(cont.why_name, makeNum(Why::CONTINUE));
+                    cont.did_why |= (1 << Why::CONTINUE);
                 }
 
                 AST_Jump* j = makeJump();
@@ -190,11 +237,11 @@ private:
     }
 
     void doBreak() {
-        for (auto& region : llvm::make_range(regions.rbegin(), regions.rend())) {
-            if (region.break_dest) {
-                if (region.say_why) {
-                    pushAssign(region.why_name, makeNum(Why::BREAK));
-                    region.did_why |= (1 << Why::BREAK);
+        for (auto& cont : llvm::make_range(continuations.rbegin(), continuations.rend())) {
+            if (cont.break_dest) {
+                if (cont.say_why) {
+                    pushAssign(cont.why_name, makeNum(Why::BREAK));
+                    cont.did_why |= (1 << Why::BREAK);
                 }
 
                 AST_Jump* j = makeJump();
@@ -1763,7 +1810,7 @@ public:
         // but we don't want it to be placed until after the orelse.
         CFGBlock* end = cfg->addDeferredBlock();
         end->info = "while_exit";
-        pushLoopRegion(test_block, end);
+        pushLoopContinuation(test_block, end);
 
         CFGBlock* body = cfg->addBlock();
         body->info = "while_body_start";
@@ -1780,7 +1827,7 @@ public:
             jbody->target = test_block;
             curblock->connectTo(test_block, true);
         }
-        popRegion();
+        popContinuation();
 
         CFGBlock* orelse = cfg->addBlock();
         orelse->info = "while_orelse_start";
@@ -1863,7 +1910,7 @@ public:
         push_back(test_false_jump);
         test_false->connectTo(else_block);
 
-        pushLoopRegion(test_block, end_block);
+        pushLoopContinuation(test_block, end_block);
 
         curblock = loop_block;
         InternedString next_name(nodeName(next_attr));
@@ -1873,7 +1920,7 @@ public:
         for (int i = 0; i < node->body.size(); i++) {
             node->body[i]->accept(this);
         }
-        popRegion();
+        popContinuation();
 
         if (curblock) {
             AST_expr* end_call = makeCall((hasnext_attr()));
@@ -2077,7 +2124,7 @@ public:
         exc_handlers.push_back({ exc_handler_block, exc_type_name, exc_value_name, exc_traceback_name });
 
         CFGBlock* finally_block = cfg->addDeferredBlock();
-        pushFinallyRegion(finally_block, exc_why_name);
+        pushFinallyContinuation(finally_block, exc_why_name);
 
         for (AST_stmt* subnode : node->body) {
             subnode->accept(this);
@@ -2085,8 +2132,8 @@ public:
 
         exc_handlers.pop_back();
 
-        int did_why = regions.back().did_why; // bad to just reach in like this
-        popRegion();                          // finally region
+        int did_why = continuations.back().did_why; // bad to just reach in like this
+        popContinuation();                          // finally continuation
 
         if (curblock) {
             // assign the exc_*_name variables to tell irgen that they won't be undefined?
@@ -2121,6 +2168,7 @@ public:
 
         if (curblock) {
             // TODO: these 4 cases are pretty copy-pasted from each other:
+            // FIXME(rntz): there are only three cases here. is there a bug here?
             if (did_why & (1 << Why::RETURN)) {
                 CFGBlock* doreturn = cfg->addBlock();
                 CFGBlock* otherwise = cfg->addBlock();
@@ -2245,24 +2293,24 @@ public:
         }
 
         CFGBlock* continue_dest = NULL, * break_dest = NULL;
-        if (regions.size()) {
+        if (continuations.size()) {
             continue_dest = cfg->addDeferredBlock();
             continue_dest->info = "with_continue";
             break_dest = cfg->addDeferredBlock();
             break_dest->info = "with_break";
 
-            pushLoopRegion(continue_dest, break_dest);
+            pushLoopContinuation(continue_dest, break_dest);
         }
 
         CFGBlock* return_dest = cfg->addDeferredBlock();
         return_dest->info = "with_return";
-        pushReturnRegion(return_dest);
+        pushReturnContinuation(return_dest);
 
         for (int i = 0; i < node->body.size(); i++) {
             node->body[i]->accept(this);
         }
 
-        popRegion(); // for the retrun
+        popContinuation(); // for the retrun
 
         AST_Call* exit_call = makeCall(makeName(exitname, AST_TYPE::Load, node->lineno));
         exit_call->args.push_back(makeName(nonename, AST_TYPE::Load, node->lineno));
@@ -2273,7 +2321,7 @@ public:
         CFGBlock* orig_ending_block = curblock;
 
         if (continue_dest) {
-            popRegion(); // for the loop region
+            popContinuation(); // for the loop continuation
             if (continue_dest->predecessors.size() == 0) {
                 delete continue_dest;
             } else {
