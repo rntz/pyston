@@ -1,4 +1,4 @@
-# fail-if: '-n' in EXTRA_JIT_ARGS or '-O' in EXTRA_JIT_ARGS
+# fail-if: ('-n' in EXTRA_JIT_ARGS or '-O' in EXTRA_JIT_ARGS) and 'pyston_release' not in IMAGE
 class ContextManager(object):
     def __enter__(self):
         print 'entered'
