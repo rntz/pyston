@@ -170,6 +170,8 @@ private:
         return name;
     }
 
+    AST_Name* makeLoad(InternedString id, AST* node) { return makeName(id, AST_TYPE::Load, node->lineno); }
+
     void pushLoopContinuation(CFGBlock* continue_dest, CFGBlock* break_dest) {
         assert(continue_dest
                != break_dest); // I guess this doesn't have to be true, but validates passing say_why=false
@@ -182,7 +184,7 @@ private:
 
     void popContinuation() { continuations.pop_back(); }
 
-    // XXX get rid of this
+    // XXX(rntz) get rid of this
     void pushReturnContinuation(CFGBlock* return_dest) {
         continuations.emplace_back(nullptr, nullptr, return_dest, false, internString(""));
     }
@@ -198,11 +200,7 @@ private:
                 }
 
                 pushAssign(internString(RETURN_NAME), value);
-
-                AST_Jump* j = makeJump(region.return_dest);
-                curblock->connectTo(region.return_dest);
-                push_back(j);
-                curblock = NULL;
+                pushJump(cont.return_dest);
                 return;
             }
         }
@@ -223,10 +221,7 @@ private:
                     cont.did_why |= (1 << Why::CONTINUE);
                 }
 
-                AST_Jump* j = makeJump(region.continue_dest);
-                curblock->connectTo(region.continue_dest, true);
-                push_back(j);
-                curblock = NULL;
+                pushJump(cont.continue_dest, true);
                 return;
             }
         }
@@ -242,10 +237,7 @@ private:
                     cont.did_why |= (1 << Why::BREAK);
                 }
 
-                AST_Jump* j = makeJump(region.break_dest);
-                curblock->connectTo(region.break_dest, true);
-                push_back(j);
-                curblock = NULL;
+                pushJump(cont.break_dest, true);
                 return;
             }
         }
@@ -266,7 +258,7 @@ private:
 
         auto name = nodeName(e);
         pushAssign(name, call);
-        return makeName(name, AST_TYPE::Load, e->lineno);
+        return makeLoad(name, e);
     }
 
     AST_Name* remapName(AST_Name* name) { return name; }
@@ -304,21 +296,13 @@ private:
             pushAssign(iter_name, iter_call);
 
             // TODO bad to save these like this?
-            AST_expr* hasnext_attr = makeLoadAttribute(makeName(iter_name, AST_TYPE::Load, node->lineno),
-                                                       internString("__hasnext__"), true);
-            AST_expr* next_attr
-                = makeLoadAttribute(makeName(iter_name, AST_TYPE::Load, node->lineno), internString("next"), true);
-
-            AST_Jump* j;
+            AST_expr* hasnext_attr = makeLoadAttribute(makeLoad(iter_name, node), internString("__hasnext__"), true);
+            AST_expr* next_attr = makeLoadAttribute(makeLoad(iter_name, node), internString("next"), true);
 
             CFGBlock* test_block = cfg->addBlock();
             test_block->info = "comprehension_test";
             // printf("Test block for comp %d is %d\n", i, test_block->idx);
-
-            j = new AST_Jump();
-            j->target = test_block;
-            curblock->connectTo(test_block);
-            push_back(j);
+            pushJump(test_block);
 
             curblock = test_block;
             AST_expr* test_call = callNonzero(remapExpr(makeCall(hasnext_attr)));
@@ -343,7 +327,7 @@ private:
             curblock = body_block;
             InternedString next_name(nodeName(next_attr));
             pushAssign(next_name, makeCall(next_attr));
-            pushAssign(c->target, makeName(next_name, AST_TYPE::Load, node->lineno));
+            pushAssign(c->target, makeLoad(next_name, node));
 
             for (AST_expr* if_condition : c->ifs) {
                 AST_expr* remapped = callNonzero(remapExpr(if_condition));
@@ -365,10 +349,7 @@ private:
                 curblock->connectTo(body_continue);
 
                 curblock = body_tramp;
-                j = new AST_Jump();
-                j->target = test_block;
-                push_back(j);
-                curblock->connectTo(test_block, true);
+                pushJump(test_block, true);
 
                 curblock = body_continue;
             }
@@ -378,21 +359,15 @@ private:
             assert((finished_block != NULL) == (i != 0));
             if (finished_block) {
                 curblock = exit_block;
-                j = new AST_Jump();
-                j->target = finished_block;
-                curblock->connectTo(finished_block, true);
-                push_back(j);
+                pushJump(finished_block, true);
             }
             finished_block = test_block;
 
             curblock = body_end;
             if (is_innermost) {
-                push_back(makeExpr(applyComprehensionCall(node, makeName(rtn_name, AST_TYPE::Load, node->lineno))));
+                push_back(makeExpr(applyComprehensionCall(node, makeLoad(rtn_name, node))));
 
-                j = new AST_Jump();
-                j->target = test_block;
-                curblock->connectTo(test_block, true);
-                push_back(j);
+                pushJump(test_block, true);
 
                 assert(exit_blocks.size());
                 curblock = exit_blocks[0];
@@ -409,7 +384,7 @@ private:
             // printf("Exit block for comp %d is %d\n", i, exit_blocks[i]->idx);
         }
 
-        return makeName(rtn_name, AST_TYPE::Load, node->lineno);
+        return makeLoad(rtn_name, node);
     }
 
     AST_expr* makeNum(int n) {
@@ -419,10 +394,12 @@ private:
         return node;
     }
 
-    AST_Jump* makeJump(CFGBlock* target) {
+    void pushJump(CFGBlock* target, bool allow_backedge = false) {
         AST_Jump* rtn = new AST_Jump();
         rtn->target = target;
-        return rtn;
+        push_back(rtn);
+        curblock->connectTo(target, allow_backedge);
+        curblock = nullptr;
     }
 
     AST_Branch* makeBranch(AST_expr* test) {
@@ -431,6 +408,17 @@ private:
         rtn->col_offset = test->col_offset;
         rtn->lineno = test->lineno;
         return rtn;
+    }
+
+    // NB. this doesn't allow these branches to be backedges, because this hasn't yet been necessary.
+    void pushBranch(AST_expr* test, CFGBlock* iftrue, CFGBlock* iffalse) {
+        AST_Branch* branch = makeBranch(test);
+        branch->iftrue = iftrue;
+        branch->iffalse = iffalse;
+        curblock->connectTo(iftrue);
+        curblock->connectTo(iffalse);
+        push_back(branch);
+        curblock = nullptr;
     }
 
     AST_expr* makeLoadAttribute(AST_expr* base, InternedString name, bool clsonly) {
@@ -463,26 +451,32 @@ private:
     }
 
     AST_Call* makeCall(AST_expr* func, AST_expr* arg0) {
-        AST_Call* call = new AST_Call();
+        auto call = makeCall(func);
         call->args.push_back(arg0);
-        call->starargs = NULL;
-        call->kwargs = NULL;
-        call->func = func;
-        call->col_offset = func->col_offset;
-        call->lineno = func->lineno;
         return call;
     }
 
     AST_Call* makeCall(AST_expr* func, AST_expr* arg0, AST_expr* arg1) {
-        AST_Call* call = new AST_Call();
+        auto call = makeCall(func);
         call->args.push_back(arg0);
         call->args.push_back(arg1);
-        call->starargs = NULL;
-        call->kwargs = NULL;
-        call->func = func;
-        call->col_offset = func->col_offset;
-        call->lineno = func->lineno;
         return call;
+    }
+
+    AST_Call* makeCall(AST_expr* func, AST_expr* arg0, AST_expr* arg1, AST_expr* arg2) {
+        auto call = makeCall(func);
+        call->args.push_back(arg0);
+        call->args.push_back(arg1);
+        call->args.push_back(arg2);
+        return call;
+    }
+
+    AST_Compare* makeCompare(AST_TYPE::AST_TYPE oper, AST_expr* left, AST_expr* right) {
+        auto compare = new AST_Compare();
+        compare->ops.push_back(AST_TYPE::Eq);
+        compare->left = left;
+        compare->comparators.push_back(right);
+        return compare;
     }
 
     void pushAssign(AST_expr* target, AST_expr* val) {
@@ -546,7 +540,7 @@ private:
                 InternedString tmp_name = nodeName(target, "", i);
                 new_target->elts.push_back(makeName(tmp_name, AST_TYPE::Store, target->lineno));
 
-                pushAssign((*elts)[i], makeName(tmp_name, AST_TYPE::Load, target->lineno));
+                pushAssign((*elts)[i], makeLoad(tmp_name, target));
             }
         } else {
             RELEASE_ASSERT(0, "%d", target->type);
@@ -691,26 +685,19 @@ private:
             }
 
             curblock = crit_break_block;
-            AST_Jump* j = new AST_Jump();
-            j->target = exit_block;
-            push_back(j);
-            crit_break_block->connectTo(exit_block);
+            pushJump(exit_block);
 
             curblock = next_block;
         }
 
         AST_expr* final_val = remapExpr(node->values[node->values.size() - 1]);
         pushAssign(name, final_val);
-
-        AST_Jump* j = new AST_Jump();
-        push_back(j);
-        j->target = exit_block;
-        curblock->connectTo(exit_block);
+        pushJump(exit_block);
 
         cfg->placeBlock(exit_block);
         curblock = exit_block;
 
-        return makeName(name, AST_TYPE::Load, node->lineno);
+        return makeLoad(name, node);
     }
 
     AST_expr* remapCall(AST_Call* node) {
@@ -790,7 +777,7 @@ private:
                 pushAssign(name, val);
 
                 AST_Branch* br = new AST_Branch();
-                br->test = callNonzero(makeName(name, AST_TYPE::Load, node->lineno));
+                br->test = callNonzero(makeLoad(name, node));
                 push_back(br);
 
                 CFGBlock* was_block = curblock;
@@ -803,25 +790,18 @@ private:
                 br->iftrue = next_block;
 
                 curblock = crit_break_block;
-                AST_Jump* j = new AST_Jump();
-                j->target = exit_block;
-                push_back(j);
-                crit_break_block->connectTo(exit_block);
+                pushJump(exit_block);
 
                 curblock = next_block;
 
                 left = _dup(right);
             }
 
-            AST_Jump* j = new AST_Jump();
-            push_back(j);
-            j->target = exit_block;
-            curblock->connectTo(exit_block);
-
+            pushJump(exit_block);
             cfg->placeBlock(exit_block);
             curblock = exit_block;
 
-            return makeName(name, AST_TYPE::Load, node->lineno);
+            return makeLoad(name, node);
         }
     }
 
@@ -868,7 +848,7 @@ private:
             loop->target = c->target;
 
             if (i == 0) {
-                loop->iter = makeName(first_generator_name, AST_TYPE::Load, node->lineno);
+                loop->iter = makeLoad(first_generator_name, node);
             } else {
                 loop->iter = c->iter;
             }
@@ -899,50 +879,38 @@ private:
 
         call->starargs = NULL;
         call->kwargs = NULL;
-        call->func = makeName(func_name, AST_TYPE::Load, node->lineno);
+        call->func = makeLoad(func_name, node);
         call->args.push_back(first);
         return call;
     };
 
     AST_expr* remapIfExp(AST_IfExp* node) {
         InternedString rtn_name = nodeName(node);
+        CFGBlock* iftrue = cfg->addDeferredBlock();
+        CFGBlock* iffalse = cfg->addDeferredBlock();
+        CFGBlock* exit_block = cfg->addDeferredBlock();
 
-        AST_Branch* br = new AST_Branch();
-        br->col_offset = node->col_offset;
-        br->lineno = node->lineno;
-        br->test = callNonzero(remapExpr(node->test));
-        push_back(br);
+        pushBranch(remapExpr(node->test), iftrue, iffalse);
 
-        CFGBlock* starting_block = curblock;
-
-        CFGBlock* iftrue = cfg->addBlock();
-        iftrue->info = "iftrue";
-        br->iftrue = iftrue;
-        starting_block->connectTo(iftrue);
+        // if true block
+        cfg->placeBlock(iftrue);
         curblock = iftrue;
+        iftrue->info = "iftrue";
         pushAssign(rtn_name, remapExpr(node->body));
-        AST_Jump* jtrue = new AST_Jump();
-        push_back(jtrue);
-        CFGBlock* endtrue = curblock;
+        pushJump(exit_block);
 
-        CFGBlock* iffalse = cfg->addBlock();
-        iffalse->info = "iffalse";
-        br->iffalse = iffalse;
-        starting_block->connectTo(iffalse);
+        // if false block
+        cfg->placeBlock(iffalse);
         curblock = iffalse;
+        iffalse->info = "iffalse";
         pushAssign(rtn_name, remapExpr(node->orelse));
-        AST_Jump* jfalse = new AST_Jump();
-        push_back(jfalse);
-        CFGBlock* endfalse = curblock;
+        pushJump(exit_block);
 
-        CFGBlock* exit_block = cfg->addBlock();
-        jtrue->target = exit_block;
-        endtrue->connectTo(exit_block);
-        jfalse->target = exit_block;
-        endfalse->connectTo(exit_block);
+        // exit block
+        cfg->placeBlock(exit_block);
         curblock = exit_block;
 
-        return makeName(rtn_name, AST_TYPE::Load, node->lineno);
+        return makeLoad(rtn_name, node);
     }
 
     AST_expr* remapIndex(AST_Index* node) {
@@ -1064,7 +1032,7 @@ private:
 
         push_back(makeExpr(new AST_LangPrimitive(AST_LangPrimitive::UNCACHE_EXC_INFO)));
 
-        return makeName(node_name, AST_TYPE::Load, node->lineno);
+        return makeLoad(node_name, node);
     }
 
     // Flattens a nested expression into a flat one, emitting instructions &
@@ -1161,7 +1129,7 @@ private:
         if (wrap_with_assign && (rtn->type != AST_TYPE::Name || ast_cast<AST_Name>(rtn)->id.str()[0] != '#')) {
             InternedString name = nodeName(node);
             pushAssign(name, rtn);
-            return makeName(name, AST_TYPE::Load, node->lineno);
+            return makeLoad(name, node);
         } else {
             return rtn;
         }
@@ -1265,10 +1233,7 @@ public:
         exc_asgn->value = new AST_LangPrimitive(AST_LangPrimitive::LANDINGPAD);
         curblock->push_back(exc_asgn);
 
-        AST_Jump* j = new AST_Jump();
-        j->target = exc_info.exc_dest;
-        curblock->push_back(j);
-        curblock->connectTo(exc_info.exc_dest);
+        pushJump(exc_info.exc_dest);
 
         if (is_raise)
             curblock = NULL;
@@ -1348,7 +1313,7 @@ public:
             if (a->asname.str().size() == 0) {
                 // No asname, so load the top-level module into the name
                 // (e.g., for `import os.path`, loads the os module into `os`)
-                pushAssign(internString(getTopModule(a->name.str())), makeName(tmpname, AST_TYPE::Load, node->lineno));
+                pushAssign(internString(getTopModule(a->name.str())), makeLoad(tmpname, node));
             } else {
                 // If there is an asname, get the bottom-level module by
                 // getting the attributes and load it into asname.
@@ -1362,11 +1327,11 @@ public:
                         l = r + 1;
                         continue;
                     }
-                    pushAssign(tmpname, new AST_Attribute(makeName(tmpname, AST_TYPE::Load, node->lineno),
-                                                          AST_TYPE::Load, internString(a->name.str().substr(l, r))));
+                    pushAssign(tmpname, new AST_Attribute(makeLoad(tmpname, node), AST_TYPE::Load,
+                                                          internString(a->name.str().substr(l, r))));
                     l = r + 1;
                 } while (l < a->name.str().size());
-                pushAssign(a->asname, makeName(tmpname, AST_TYPE::Load, node->lineno));
+                pushAssign(a->asname, makeLoad(tmpname, node));
             }
         }
 
@@ -1407,7 +1372,7 @@ public:
                 AST_LangPrimitive* import_star = new AST_LangPrimitive(AST_LangPrimitive::IMPORT_STAR);
                 import_star->lineno = node->lineno;
                 import_star->col_offset = node->col_offset;
-                import_star->args.push_back(makeName(tmp_module_name, AST_TYPE::Load, node->lineno));
+                import_star->args.push_back(makeLoad(tmp_module_name, node));
 
                 AST_Expr* import_star_expr = new AST_Expr();
                 import_star_expr->value = import_star;
@@ -1417,13 +1382,12 @@ public:
                 AST_LangPrimitive* import_from = new AST_LangPrimitive(AST_LangPrimitive::IMPORT_FROM);
                 import_from->lineno = node->lineno;
                 import_from->col_offset = node->col_offset;
-                import_from->args.push_back(makeName(tmp_module_name, AST_TYPE::Load, node->lineno));
+                import_from->args.push_back(makeLoad(tmp_module_name, node));
                 import_from->args.push_back(new AST_Str(a->name.str()));
 
                 InternedString tmp_import_name = nodeName(a);
                 pushAssign(tmp_import_name, import_from);
-                pushAssign(a->asname.str().size() ? a->asname : a->name,
-                           makeName(tmp_import_name, AST_TYPE::Load, node->lineno));
+                pushAssign(a->asname.str().size() ? a->asname : a->name, makeLoad(tmp_import_name, node));
             }
         }
 
@@ -1466,17 +1430,10 @@ public:
 
         CFGBlock* unreachable = cfg->addBlock();
         unreachable->info = "unreachable";
-        curblock->connectTo(unreachable);
-
-        AST_Jump* j = new AST_Jump();
-        j->target = unreachable;
-        push_back(j);
+        pushJump(unreachable);
 
         curblock = unreachable;
-        AST_Jump* j2 = new AST_Jump();
-        j2->target = unreachable;
-        push_back(j2);
-        curblock->connectTo(unreachable, true);
+        pushJump(unreachable, true);
 
         curblock = iftrue;
 
@@ -1519,9 +1476,9 @@ public:
                 AST_Name* n = ast_cast<AST_Name>(node->target);
                 assert(n->ctx_type == AST_TYPE::Store);
                 InternedString n_name(nodeName(n));
-                pushAssign(n_name, makeName(n->id, AST_TYPE::Load, node->lineno));
+                pushAssign(n_name, makeLoad(n->id, node));
                 remapped_target = n;
-                remapped_lhs = makeName(n_name, AST_TYPE::Load, node->lineno);
+                remapped_lhs = makeLoad(n_name, node);
                 break;
             }
             case AST_TYPE::Subscript: {
@@ -1581,7 +1538,7 @@ public:
 
         InternedString node_name(nodeName(node));
         pushAssign(node_name, binop);
-        pushAssign(remapped_target, makeName(node_name, AST_TYPE::Load, node->lineno));
+        pushAssign(remapped_target, makeLoad(node_name, node));
         return true;
     }
 
@@ -1707,7 +1664,7 @@ public:
 
         AST_expr* value = remapExpr(node->value);
         if (value == NULL)
-            value = makeName(internString("None"), AST_TYPE::Load, node->lineno);
+            value = makeLoad(internString("None"), node);
         doReturn(value);
         return true;
     }
@@ -1735,10 +1692,7 @@ public:
             node->body[i]->accept(this);
         }
         if (curblock) {
-            AST_Jump* jtrue = new AST_Jump();
-            push_back(jtrue);
-            jtrue->target = exit;
-            curblock->connectTo(exit);
+            pushJump(exit);
         }
 
         CFGBlock* iffalse = cfg->addBlock();
@@ -1751,10 +1705,7 @@ public:
             node->orelse[i]->accept(this);
         }
         if (curblock) {
-            AST_Jump* jfalse = new AST_Jump();
-            push_back(jfalse);
-            jfalse->target = exit;
-            curblock->connectTo(exit);
+            pushJump(exit);
         }
 
         if (exit->predecessors.size() == 0) {
@@ -1793,10 +1744,7 @@ public:
 
         CFGBlock* test_block = cfg->addBlock();
         test_block->info = "while_test";
-
-        AST_Jump* j = makeJump(test_block);
-        push_back(j);
-        curblock->connectTo(test_block);
+        pushJump(test_block);
 
         curblock = test_block;
         AST_Branch* br = makeBranch(remapExpr(node->test));
@@ -1818,11 +1766,8 @@ public:
         for (int i = 0; i < node->body.size(); i++) {
             node->body[i]->accept(this);
         }
-        if (curblock) {
-            AST_Jump* jbody = makeJump(test_block);
-            push_back(jbody);
-            curblock->connectTo(test_block, true);
-        }
+        if (curblock)
+            pushJump(test_block, true);
         popContinuation();
 
         CFGBlock* orelse = cfg->addBlock();
@@ -1833,11 +1778,8 @@ public:
         for (int i = 0; i < node->orelse.size(); i++) {
             node->orelse[i]->accept(this);
         }
-        if (curblock) {
-            AST_Jump* jend = makeJump(end);
-            push_back(jend);
-            curblock->connectTo(end);
-        }
+        if (curblock)
+            pushJump(end);
         curblock = end;
 
         cfg->placeBlock(end);
@@ -1862,17 +1804,12 @@ public:
         InternedString itername = internString(itername_buf);
         pushAssign(itername, iter_call);
 
-        auto hasnext_attr = [&]() {
-            return makeLoadAttribute(makeName(itername, AST_TYPE::Load, node->lineno), internString("__hasnext__"),
-                                     true);
-        };
-        AST_expr* next_attr
-            = makeLoadAttribute(makeName(itername, AST_TYPE::Load, node->lineno), internString("next"), true);
+        auto hasnext_attr =
+            [&]() { return makeLoadAttribute(makeLoad(itername, node), internString("__hasnext__"), true); };
+        AST_expr* next_attr = makeLoadAttribute(makeLoad(itername, node), internString("next"), true);
 
         CFGBlock* test_block = cfg->addBlock();
-        AST_Jump* jump_to_test = makeJump(test_block);
-        push_back(jump_to_test);
-        curblock->connectTo(test_block);
+        pushJump(test_block);
         curblock = test_block;
 
         AST_expr* test_call = makeCall(hasnext_attr());
@@ -1891,23 +1828,18 @@ public:
         CFGBlock* else_block = cfg->addDeferredBlock();
 
         curblock = test_true;
-
         // TODO simplify the breaking of these crit edges?
-        AST_Jump* test_true_jump = makeJump(loop_block);
-        push_back(test_true_jump);
-        test_true->connectTo(loop_block);
+        pushJump(loop_block);
 
         curblock = test_false;
-        AST_Jump* test_false_jump = makeJump(else_block);
-        push_back(test_false_jump);
-        test_false->connectTo(else_block);
+        pushJump(else_block);
 
         pushLoopContinuation(test_block, end_block);
 
         curblock = loop_block;
         InternedString next_name(nodeName(next_attr));
         pushAssign(next_name, makeCall(next_attr));
-        pushAssign(node->target, makeName(next_name, AST_TYPE::Load, node->lineno));
+        pushAssign(node->target, makeLoad(next_name, node));
 
         for (int i = 0; i < node->body.size(); i++) {
             node->body[i]->accept(this);
@@ -1927,14 +1859,10 @@ public:
             curblock->connectTo(end_false);
 
             curblock = end_true;
-            AST_Jump* end_true_jump = makeJump(loop_block);
-            push_back(end_true_jump);
-            end_true->connectTo(loop_block, true);
+            pushJump(loop_block, true);
 
             curblock = end_false;
-            AST_Jump* end_false_jump = makeJump(else_block);
-            push_back(end_false_jump);
-            end_false->connectTo(else_block);
+            pushJump(else_block);
         }
 
         cfg->placeBlock(else_block);
@@ -1943,11 +1871,8 @@ public:
         for (int i = 0; i < node->orelse.size(); i++) {
             node->orelse[i]->accept(this);
         }
-        if (curblock) {
-            AST_Jump* else_jump = makeJump(end_block);
-            push_back(else_jump);
-            curblock->connectTo(end_block);
-        }
+        if (curblock)
+            pushJump(end_block);
 
         cfg->placeBlock(end_block);
         curblock = end_block;
@@ -2008,12 +1933,8 @@ public:
         }
 
         CFGBlock* join_block = cfg->addDeferredBlock();
-        if (curblock) {
-            AST_Jump* j = new AST_Jump();
-            j->target = join_block;
-            push_back(j);
-            curblock->connectTo(join_block);
-        }
+        if (curblock)
+            pushJump(join_block);
 
         if (exc_handler_block->predecessors.size() == 0) {
             delete exc_handler_block;
@@ -2022,7 +1943,7 @@ public:
             curblock = exc_handler_block;
 
             // TODO This is supposed to be exc_type_name (value doesn't matter for checking matches)
-            AST_expr* exc_obj = makeName(exc_value_name, AST_TYPE::Load, node->lineno);
+            AST_expr* exc_obj = makeLoad(exc_value_name, node);
 
             bool caught_all = false;
             for (AST_ExceptHandler* exc_handler : node->handlers) {
@@ -2055,9 +1976,9 @@ public:
                 }
 
                 AST_LangPrimitive* set_exc_info = new AST_LangPrimitive(AST_LangPrimitive::SET_EXC_INFO);
-                set_exc_info->args.push_back(makeName(exc_type_name, AST_TYPE::Load, node->lineno));
-                set_exc_info->args.push_back(makeName(exc_value_name, AST_TYPE::Load, node->lineno));
-                set_exc_info->args.push_back(makeName(exc_traceback_name, AST_TYPE::Load, node->lineno));
+                set_exc_info->args.push_back(makeLoad(exc_type_name, node));
+                set_exc_info->args.push_back(makeLoad(exc_value_name, node));
+                set_exc_info->args.push_back(makeLoad(exc_traceback_name, node));
                 push_back(makeExpr(set_exc_info));
 
                 if (exc_handler->name) {
@@ -2069,10 +1990,7 @@ public:
                 }
 
                 if (curblock) {
-                    AST_Jump* j = new AST_Jump();
-                    j->target = join_block;
-                    push_back(j);
-                    curblock->connectTo(join_block);
+                    pushJump(join_block);
                 }
 
                 if (exc_next) {
@@ -2085,9 +2003,9 @@ public:
 
             if (!caught_all) {
                 AST_Raise* raise = new AST_Raise();
-                raise->arg0 = makeName(exc_type_name, AST_TYPE::Load, node->lineno);
-                raise->arg1 = makeName(exc_value_name, AST_TYPE::Load, node->lineno);
-                raise->arg2 = makeName(exc_traceback_name, AST_TYPE::Load, node->lineno);
+                raise->arg0 = makeLoad(exc_type_name, node);
+                raise->arg1 = makeLoad(exc_value_name, node);
+                raise->arg2 = makeLoad(exc_traceback_name, node);
                 push_back(raise);
                 curblock = NULL;
             }
@@ -2128,10 +2046,7 @@ public:
             // assign the exc_*_name variables to tell irgen that they won't be undefined?
             // have an :UNDEF() langprimitive to not have to do any loading there?
             pushAssign(exc_why_name, makeNum(Why::FALLTHROUGH));
-            AST_Jump* j = new AST_Jump();
-            j->target = finally_block;
-            push_back(j);
-            curblock->connectTo(finally_block);
+            pushJump(finally_block);
         }
 
         if (exc_handler_block->predecessors.size() == 0) {
@@ -2139,13 +2054,8 @@ public:
         } else {
             cfg->placeBlock(exc_handler_block);
             curblock = exc_handler_block;
-
             pushAssign(exc_why_name, makeNum(Why::EXCEPTION));
-
-            AST_Jump* j = new AST_Jump();
-            j->target = finally_block;
-            push_back(j);
-            curblock->connectTo(finally_block);
+            pushJump(finally_block);
         }
 
         cfg->placeBlock(finally_block);
@@ -2164,7 +2074,7 @@ public:
 
                 AST_Compare* compare = new AST_Compare();
                 compare->ops.push_back(AST_TYPE::Eq);
-                compare->left = makeName(exc_why_name, AST_TYPE::Load, node->lineno);
+                compare->left = makeLoad(exc_why_name, node);
                 compare->comparators.push_back(makeNum(Why::RETURN));
 
                 AST_Branch* br = new AST_Branch();
@@ -2176,7 +2086,7 @@ public:
                 push_back(br);
 
                 curblock = doreturn;
-                doReturn(makeName(internString(RETURN_NAME), AST_TYPE::Load, node->lineno));
+                doReturn(makeLoad(internString(RETURN_NAME), node));
 
                 curblock = otherwise;
             }
@@ -2187,7 +2097,7 @@ public:
 
                 AST_Compare* compare = new AST_Compare();
                 compare->ops.push_back(AST_TYPE::Eq);
-                compare->left = makeName(exc_why_name, AST_TYPE::Load, node->lineno);
+                compare->left = makeLoad(exc_why_name, node);
                 compare->comparators.push_back(makeNum(Why::BREAK));
 
                 AST_Branch* br = new AST_Branch();
@@ -2210,7 +2120,7 @@ public:
 
                 AST_Compare* compare = new AST_Compare();
                 compare->ops.push_back(AST_TYPE::Eq);
-                compare->left = makeName(exc_why_name, AST_TYPE::Load, node->lineno);
+                compare->left = makeLoad(exc_why_name, node);
                 compare->comparators.push_back(makeNum(Why::CONTINUE));
 
                 AST_Branch* br = new AST_Branch();
@@ -2229,7 +2139,7 @@ public:
 
             AST_Compare* compare = new AST_Compare();
             compare->ops.push_back(AST_TYPE::Eq);
-            compare->left = makeName(exc_why_name, AST_TYPE::Load, node->lineno);
+            compare->left = makeLoad(exc_why_name, node);
             compare->comparators.push_back(makeNum(Why::EXCEPTION));
 
             AST_Branch* br = new AST_Branch();
@@ -2246,9 +2156,9 @@ public:
 
             curblock = reraise;
             AST_Raise* raise = new AST_Raise();
-            raise->arg0 = makeName(exc_type_name, AST_TYPE::Load, node->lineno);
-            raise->arg1 = makeName(exc_value_name, AST_TYPE::Load, node->lineno);
-            raise->arg2 = makeName(exc_traceback_name, AST_TYPE::Load, node->lineno);
+            raise->arg0 = makeLoad(exc_type_name, node);
+            raise->arg1 = makeLoad(exc_value_name, node);
+            raise->arg2 = makeLoad(exc_traceback_name, node);
             push_back(raise);
 
             curblock = noexc;
@@ -2316,10 +2226,10 @@ public:
             } else {
                 curblock = continue_dest;
 
-                AST_Call* exit_call = makeCall(makeName(exitname, AST_TYPE::Load, node->lineno));
-                exit_call->args.push_back(makeName(nonename, AST_TYPE::Load, node->lineno));
-                exit_call->args.push_back(makeName(nonename, AST_TYPE::Load, node->lineno));
-                exit_call->args.push_back(makeName(nonename, AST_TYPE::Load, node->lineno));
+                AST_Call* exit_call = makeCall(makeLoad(exitname, node));
+                exit_call->args.push_back(makeLoad(nonename, node));
+                exit_call->args.push_back(makeLoad(nonename, node));
+                exit_call->args.push_back(makeLoad(nonename, node));
                 push_back(makeExpr(exit_call));
 
                 cfg->placeBlock(continue_dest);
@@ -2331,10 +2241,10 @@ public:
             } else {
                 curblock = break_dest;
 
-                AST_Call* exit_call = makeCall(makeName(exitname, AST_TYPE::Load, node->lineno));
-                exit_call->args.push_back(makeName(nonename, AST_TYPE::Load, node->lineno));
-                exit_call->args.push_back(makeName(nonename, AST_TYPE::Load, node->lineno));
-                exit_call->args.push_back(makeName(nonename, AST_TYPE::Load, node->lineno));
+                AST_Call* exit_call = makeCall(makeLoad(exitname, node));
+                exit_call->args.push_back(makeLoad(nonename, node));
+                exit_call->args.push_back(makeLoad(nonename, node));
+                exit_call->args.push_back(makeLoad(nonename, node));
                 push_back(makeExpr(exit_call));
 
                 cfg->placeBlock(break_dest);
@@ -2349,13 +2259,13 @@ public:
             cfg->placeBlock(return_dest);
             curblock = return_dest;
 
-            AST_Call* exit_call = makeCall(makeName(exitname, AST_TYPE::Load, node->lineno));
-            exit_call->args.push_back(makeName(nonename, AST_TYPE::Load, node->lineno));
-            exit_call->args.push_back(makeName(nonename, AST_TYPE::Load, node->lineno));
-            exit_call->args.push_back(makeName(nonename, AST_TYPE::Load, node->lineno));
+            AST_Call* exit_call = makeCall(makeLoad(exitname, node));
+            exit_call->args.push_back(makeLoad(nonename, node));
+            exit_call->args.push_back(makeLoad(nonename, node));
+            exit_call->args.push_back(makeLoad(nonename, node));
             push_back(makeExpr(exit_call));
 
-            doReturn(makeName(internString(RETURN_NAME), AST_TYPE::Load, node->lineno));
+            doReturn(makeLoad(internString(RETURN_NAME), node));
             curblock = orig_ending_block;
         }
 
