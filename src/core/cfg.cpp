@@ -1181,6 +1181,7 @@ public:
             if (asgn->targets[0]->type == AST_TYPE::Name) {
                 AST_Name* target = ast_cast<AST_Name>(asgn->targets[0]);
                 if (target->id.str()[0] != '#') {
+// assigning to a non-temporary
 #ifndef NDEBUG
                     if (!(asgn->value->type == AST_TYPE::Name && ast_cast<AST_Name>(asgn->value)->id.str()[0] == '#')
                         && asgn->value->type != AST_TYPE::Str && asgn->value->type != AST_TYPE::Num) {
@@ -1196,8 +1197,12 @@ public:
                     // Assigning from one temporary name to another:
                     curblock->push_back(node);
                     return;
-                } else if (asgn->value->type == AST_TYPE::Num || asgn->value->type == AST_TYPE::Str) {
+                } else if (asgn->value->type == AST_TYPE::Num || asgn->value->type == AST_TYPE::Str
+                           || (asgn->value->type == AST_TYPE::Name
+                               && ast_cast<AST_Name>(asgn->value)->id.str().compare("None") == 0)) {
                     // Assigning to a temporary name from an expression that can't throw:
+                    // NB. `None' can't throw in Python, because it's hardcoded
+                    // (seriously, try reassigning "None" in CPython).
                     curblock->push_back(node);
                     return;
                 }
@@ -1671,10 +1676,7 @@ public:
         if (!curblock)
             return true;
 
-        AST_expr* value = remapExpr(node->value);
-        if (value == NULL)
-            value = makeLoad(internString("None"), node);
-        doReturn(value);
+        doReturn(node->value ? remapExpr(node->value) : makeLoad(internString("None"), node));
         return true;
     }
 
