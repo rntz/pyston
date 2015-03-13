@@ -54,6 +54,29 @@ void CFGBlock::unconnectFrom(CFGBlock* successor) {
                                   successor->predecessors.end());
 }
 
+void CFGBlock::print() {
+    printf("Block %d", idx);
+    if (info)
+        printf(" '%s'", info);
+
+    printf("; Predecessors:");
+    for (int j = 0; j < predecessors.size(); j++) {
+        printf(" %d", predecessors[j]->idx);
+    }
+    printf(" Successors:");
+    for (int j = 0; j < successors.size(); j++) {
+        printf(" %d", successors[j]->idx);
+    }
+    printf("\n");
+
+    PrintVisitor pv(4);
+    for (int j = 0; j < body.size(); j++) {
+        printf("    ");
+        body[j]->accept(&pv);
+        printf("\n");
+    }
+}
+
 static const std::string RETURN_NAME("#rtnval");
 
 class CFGVisitor : public ASTVisitor {
@@ -2330,30 +2353,8 @@ public:
 void CFG::print() {
     printf("CFG:\n");
     printf("%ld blocks\n", blocks.size());
-    PrintVisitor* pv = new PrintVisitor(4);
-    for (int i = 0; i < blocks.size(); i++) {
-        CFGBlock* b = blocks[i];
-        printf("Block %d", b->idx);
-        if (b->info)
-            printf(" '%s'", b->info);
-
-        printf("; Predecessors:");
-        for (int j = 0; j < b->predecessors.size(); j++) {
-            printf(" %d", b->predecessors[j]->idx);
-        }
-        printf(" Successors:");
-        for (int j = 0; j < b->successors.size(); j++) {
-            printf(" %d", b->successors[j]->idx);
-        }
-        printf("\n");
-
-        for (int j = 0; j < b->body.size(); j++) {
-            printf("    ");
-            b->body[j]->accept(pv);
-            printf("\n");
-        }
-    }
-    delete pv;
+    for (int i = 0; i < blocks.size(); i++)
+        blocks[i]->print();
 }
 
 CFG* computeCFG(SourceInfo* source, std::vector<AST_stmt*> body) {

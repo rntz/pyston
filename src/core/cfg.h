@@ -56,6 +56,7 @@ public:
     void unconnectFrom(CFGBlock* successor);
 
     void push_back(AST_stmt* node) { body.push_back(node); }
+    void print();
 };
 
 // Control Flow Graph
