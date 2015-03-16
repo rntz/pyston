@@ -783,8 +783,6 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
                 ASSERT(it->second.first == v->getType(), "");
                 llvm_phi->addIncoming(v->getValue(), osr_unbox_block_end);
             }
-
-            InternedString is_defined_name = getIsDefinedName(it->first, source->getInternedStrings());
         }
         for (auto t : phi_args) {
             std::get<0>(t)->addIncoming(std::get<1>(t), std::get<2>(t));
