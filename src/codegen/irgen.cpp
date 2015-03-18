@@ -802,19 +802,22 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
 
         bool this_is_osr_entry = (entry_descriptor && b == entry_descriptor->backedge->target);
 
+#ifndef NDEBUG
+        // Check to see that all blocks agree on what symbols + types they should be propagating for phis.
         for (int j = 0; j < b->predecessors.size(); j++) {
             CFGBlock* b2 = b->predecessors[j];
             if (blocks.count(b2) == 0)
                 continue;
 
             // printf("(%d %ld) -> (%d %ld)\n", b2->idx, phi_ending_symbol_tables[b2]->size(), b->idx, phis->size());
-            compareKeyset(phi_ending_symbol_tables[b2], phis);
+            assert(sameKeyset(phi_ending_symbol_tables[b2], phis));
             assert(phi_ending_symbol_tables[b2]->size() == phis->size());
         }
 
         if (this_is_osr_entry) {
-            compareKeyset(osr_syms, phis);
+            assert(sameKeyset(osr_syms, phis));
         }
+#endif // end checking phi agreement.
 
         // Can't always add the phi incoming value right away, since we may have to create more
         // basic blocks as part of type coercion.

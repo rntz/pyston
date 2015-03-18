@@ -54,7 +54,7 @@ void removeDirectoryIfExists(const std::string& path);
 
 // Checks that lhs and rhs, which are iterables of InternedStrings, have the
 // same set of names in them.
-template <class T1, class T2> void compareKeyset(T1* lhs, T2* rhs) {
+template <class T1, class T2> bool sameKeyset(T1* lhs, T2* rhs) {
     std::vector<InternedString> lv, rv;
     for (typename T1::iterator it = lhs->begin(); it != lhs->end(); it++) {
         lv.push_back(it->first);
@@ -91,7 +91,7 @@ template <class T1, class T2> void compareKeyset(T1* lhs, T2* rhs) {
         }
         good = false;
     }
-    assert(good);
+    return good;
 }
 }
 
