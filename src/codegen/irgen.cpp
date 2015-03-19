@@ -516,6 +516,8 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
         created_phis[block] = phis;
 
         // Set initial symbol table:
+        // If we're in the starting block, no phis or symbol table changes for us.
+        // Generate function entry code instead.
         if (block == source->cfg->getStartingBlock()) {
             assert(entry_descriptor == NULL);
 
@@ -757,7 +759,7 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
                 for (auto it = pred_st->begin(); it != pred_st->end(); ++it) {
                     InternedString name = it->first;
                     ConcreteCompilerVariable* cv = it->second; // incoming CCV from predecessor block
-                    // printf("block %d: adding phi for %s\n", block->idx, name.c_str());
+                    // printf("block %d: adding phi for %s from pred %d\n", block->idx, name.c_str(), pred->idx);
                     llvm::PHINode* phi = emitter->getBuilder()->CreatePHI(cv->getType()->llvmType(),
                                                                           block->predecessors.size(), name.str());
                     // emitter->getBuilder()->CreateCall(g.funcs.dump, phi);
@@ -769,6 +771,7 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
             }
         }
 
+        // Generate loop safepoints on backedges.
         for (CFGBlock* predecessor : block->predecessors) {
             if (predecessor->idx > block->idx) {
                 // Loop safepoint:
@@ -778,6 +781,7 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
             }
         }
 
+        // Generate the IR for the block.
         generator->run(block);
 
         const IRGenerator::EndingState& ending_st = generator->getEndingSymbolTable();
@@ -790,7 +794,7 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
     }
 
     ////
-    // Phi generation.
+    // Phi population.
     // We don't know the exact ssa values to back-propagate to the phi nodes until we've generated
     // the relevant IR, so after we have done all of it, go back through and populate the phi nodes.
     // Also, do some checking to make sure that the phi analysis stuff worked out, and that all blocks
@@ -805,13 +809,14 @@ static void emitBBs(IRGenState* irstate, TypeAnalysis* types, const OSREntryDesc
 #ifndef NDEBUG
         // Check to see that all blocks agree on what symbols + types they should be propagating for phis.
         for (int j = 0; j < b->predecessors.size(); j++) {
-            CFGBlock* b2 = b->predecessors[j];
-            if (blocks.count(b2) == 0)
+            CFGBlock* bpred = b->predecessors[j];
+            if (blocks.count(bpred) == 0)
                 continue;
 
-            // printf("(%d %ld) -> (%d %ld)\n", b2->idx, phi_ending_symbol_tables[b2]->size(), b->idx, phis->size());
-            assert(sameKeyset(phi_ending_symbol_tables[b2], phis));
-            assert(phi_ending_symbol_tables[b2]->size() == phis->size());
+            // printf("(%d %ld) -> (%d %ld)\n", bpred->idx, phi_ending_symbol_tables[bpred]->size(), b->idx,
+            // phis->size());
+            assert(sameKeyset(phi_ending_symbol_tables[bpred], phis));
+            assert(phi_ending_symbol_tables[bpred]->size() == phis->size());
         }
 
         if (this_is_osr_entry) {

@@ -2069,9 +2069,9 @@ private:
         SourceInfo* source = irstate->getSourceInfo();
         ScopeInfo* scope_info = irstate->getScopeInfo();
 
-        // Additional names to remove; remove them after iteration is done to new mess up the iterators
+        // Additional names to remove; remove them after iteration is done to not mess up the iterators
         std::vector<InternedString> also_remove;
-        for (SymbolTable::iterator it = symbol_table.begin(); it != symbol_table.end();) {
+        for (auto it = symbol_table.begin(); it != symbol_table.end();) {
             if (allowableFakeEndingSymbol(it->first)) {
                 ++it;
                 continue;
@@ -2082,7 +2082,7 @@ private:
 
             if (!source->liveness->isLiveAtEnd(it->first, myblock)) {
                 // printf("%s dead at end of %d; grabbed = %d, %d vrefs\n", it->first.c_str(), myblock->idx,
-                // it->second->isGrabbed(), it->second->getVrefs());
+                //        it->second->isGrabbed(), it->second->getVrefs());
                 also_remove.push_back(getIsDefinedName(it->first));
 
                 it->second->decvref(emitter);
