@@ -498,6 +498,8 @@ PyAPI_DATA(PyTypeObject*) type_cls;
 // Pyston change: this is no longer a static object
 //PyAPI_DATA(PyTypeObject) PyBaseObject_Type; /* built-in 'object' */
 //PyAPI_DATA(PyTypeObject) PySuper_Type; /* built-in 'super' */
+PyAPI_DATA(PyTypeObject*) object_cls;
+#define PyBaseObject_Type (*object_cls)
 
 // Pyston changes: these aren't direct macros any more [they potentially could be though]
 PyAPI_FUNC(bool) _PyType_Check(PyObject*) PYSTON_NOEXCEPT;
@@ -558,10 +560,10 @@ extern int _PyObject_SlotCompare(PyObject *, PyObject *);
 /* Same as PyObject_Generic{Get,Set}Attr, but passing the attributes
    dict as the last parameter. */
 PyAPI_FUNC(PyObject *)
-_PyObject_GenericGetAttrWithDict(PyObject *, PyObject *, PyObject *);
+_PyObject_GenericGetAttrWithDict(PyObject *, PyObject *, PyObject *) PYSTON_NOEXCEPT;
 PyAPI_FUNC(int)
 _PyObject_GenericSetAttrWithDict(PyObject *, PyObject *,
-                                 PyObject *, PyObject *);
+                                 PyObject *, PyObject *) PYSTON_NOEXCEPT;
 
 
 /* PyObject_Dir(obj) acts like Python __builtin__.dir(obj), returning a

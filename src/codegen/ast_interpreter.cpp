@@ -176,6 +176,7 @@ ASTInterpreter::ASTInterpreter(CompiledFunction* compiled_function)
         source_info->cfg = computeCFG(f->source, f->source->body);
 
     scope_info = source_info->getScopeInfo();
+    assert(scope_info);
 }
 
 void ASTInterpreter::initArguments(int nargs, BoxedClosure* _closure, BoxedGenerator* _generator, Box* arg1, Box* arg2,
@@ -674,7 +675,6 @@ Box* ASTInterpreter::createFunction(AST* node, AST_arguments* args, const std::v
         }
         assert(closure);
     }
-
     return boxCLFunction(cl, closure, is_generator, u.il);
 }
 

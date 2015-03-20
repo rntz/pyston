@@ -461,8 +461,8 @@ PythonFrameIterator::Manager unwindPythonFrames() {
 
 static std::unique_ptr<PythonFrameIterator> getTopPythonFrame() {
     std::unique_ptr<PythonFrameIterator> fr = PythonFrameIterator::begin();
-    RELEASE_ASSERT(fr != PythonFrameIterator::end(), "no valid python frames??");
-
+    if (fr == PythonFrameIterator::end())
+        return std::unique_ptr<PythonFrameIterator>();
     return fr;
 }
 
@@ -522,8 +522,9 @@ ExcInfo* getFrameExcInfo() {
         *copy_from_exc = ExcInfo(None, None, None);
     }
 
-    assert(copy_from_exc->value);
-    assert(copy_from_exc->traceback);
+    assert(gc::isValidGCObject(copy_from_exc->type));
+    assert(gc::isValidGCObject(copy_from_exc->value));
+    assert(gc::isValidGCObject(copy_from_exc->traceback));
 
     for (auto* ex : to_update) {
         *ex = *copy_from_exc;
@@ -533,12 +534,16 @@ ExcInfo* getFrameExcInfo() {
 }
 
 CompiledFunction* getTopCompiledFunction() {
+    auto rtn = getTopPythonFrame();
+    if (!rtn)
+        return NULL;
     return getTopPythonFrame()->getCF();
 }
 
 BoxedModule* getCurrentModule() {
     CompiledFunction* compiledFunction = getTopCompiledFunction();
-    assert(compiledFunction);
+    if (!compiledFunction)
+        return NULL;
     return compiledFunction->clfunc->source->parent_module;
 }
 
@@ -644,7 +649,7 @@ BoxedDict* getLocals(bool only_user_visible, bool includeClosure) {
             for (; closure != NULL; closure = closure->parent) {
                 assert(closure->cls == closure_cls);
                 for (auto& attr_offset : closure->attrs.hcls->attr_offsets) {
-                    const std::string& name = attr_offset.first;
+                    const std::string& name = attr_offset.first();
                     int offset = attr_offset.second;
                     Box* val = closure->attrs.attr_list->attrs[offset];
                     ScopeInfo* scope_info = cf->clfunc->source->getScopeInfo();

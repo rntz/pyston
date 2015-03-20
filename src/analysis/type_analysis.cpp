@@ -452,7 +452,13 @@ private:
 
     void* visit_slice(AST_Slice* node) override { return SLICE; }
 
-    void* visit_str(AST_Str* node) override { return STR; }
+    void* visit_str(AST_Str* node) override {
+        if (node->str_type == AST_Str::STR)
+            return STR;
+        else if (node->str_type == AST_Str::UNICODE)
+            return typeFromClass(unicode_cls);
+        RELEASE_ASSERT(0, "Unknown string type %d", (int)node->str_type);
+    }
 
     void* visit_subscript(AST_Subscript* node) override {
         CompilerType* val = getType(node->value);
@@ -516,7 +522,7 @@ private:
         // TODO should we speculate that classdefs will generally return a class?
         // CompilerType* t = typeFromClass(type_cls);
         CompilerType* t = UNKNOWN;
-        _doSet(node->name, t);
+        _doSet(scope_info->mangleName(node->name), t);
     }
 
     void visit_delete(AST_Delete* node) override {
@@ -553,7 +559,10 @@ private:
             getType(d);
         }
 
-        _doSet(node->name, typeFromClass(function_cls));
+        CompilerType* t = UNKNOWN;
+        if (node->decorator_list.empty())
+            t = typeFromClass(function_cls);
+        _doSet(scope_info->mangleName(node->name), t);
     }
 
     void visit_global(AST_Global* node) override {}

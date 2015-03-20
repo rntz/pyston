@@ -66,14 +66,15 @@ struct ArgPassSpec {
 
     int totalPassed() { return num_args + num_keywords + (has_starargs ? 1 : 0) + (has_kwargs ? 1 : 0); }
 
-    uintptr_t asInt() const { return *reinterpret_cast<const uintptr_t*>(this); }
+    uint32_t asInt() const { return *reinterpret_cast<const uint32_t*>(this); }
 
     void dump() {
         printf("(has_starargs=%s, has_kwargs=%s, num_keywords=%d, num_args=%d)\n", has_starargs ? "true" : "false",
                has_kwargs ? "true" : "false", num_keywords, num_args);
     }
 };
-static_assert(sizeof(ArgPassSpec) <= sizeof(void*), "ArgPassSpec doesn't fit in register!");
+static_assert(sizeof(ArgPassSpec) <= sizeof(void*), "ArgPassSpec doesn't fit in register! (CC is probably wrong)");
+static_assert(sizeof(ArgPassSpec) == sizeof(uint32_t), "ArgPassSpec::asInt needs to be updated");
 
 namespace gc {
 
@@ -156,14 +157,11 @@ public:
 struct FunctionSpecialization {
     ConcreteCompilerType* rtn_type;
     std::vector<ConcreteCompilerType*> arg_types;
+    bool boxed_return_value;
+    bool accepts_all_inputs;
 
-    FunctionSpecialization(ConcreteCompilerType* rtn_type) : rtn_type(rtn_type) {}
-
-    FunctionSpecialization(ConcreteCompilerType* rtn_type, ConcreteCompilerType* arg1, ConcreteCompilerType* arg2)
-        : rtn_type(rtn_type), arg_types({ arg1, arg2 }) {}
-
-    FunctionSpecialization(ConcreteCompilerType* rtn_type, const std::vector<ConcreteCompilerType*>& arg_types)
-        : rtn_type(rtn_type), arg_types(arg_types) {}
+    FunctionSpecialization(ConcreteCompilerType* rtn_type);
+    FunctionSpecialization(ConcreteCompilerType* rtn_type, const std::vector<ConcreteCompilerType*>& arg_types);
 };
 
 class BoxedClosure;
@@ -261,6 +259,8 @@ public:
     const std::string getName();
     InternedString mangleName(InternedString id);
 
+    Box* getDocString();
+
     SourceInfo(BoxedModule* m, ScopingAnalysis* scoping, AST* ast, const std::vector<AST_stmt*>& body);
 };
 
@@ -277,6 +277,7 @@ public:
 
     FunctionList
         versions; // any compiled versions along with their type parameters; in order from most preferred to least
+    CompiledFunction* always_use_version; // if this version is set, always use it (for unboxed cases)
     std::unordered_map<const OSREntryDescriptor*, CompiledFunction*> osr_versions;
 
     // Functions can provide an "internal" version, which will get called instead
@@ -289,12 +290,12 @@ public:
 
     CLFunction(int num_args, int num_defaults, bool takes_varargs, bool takes_kwargs, SourceInfo* source)
         : num_args(num_args), num_defaults(num_defaults), takes_varargs(takes_varargs), takes_kwargs(takes_kwargs),
-          source(source), param_names(source->ast) {
+          source(source), param_names(source->ast), always_use_version(NULL) {
         assert(num_args >= num_defaults);
     }
     CLFunction(int num_args, int num_defaults, bool takes_varargs, bool takes_kwargs, const ParamNames& param_names)
         : num_args(num_args), num_defaults(num_defaults), takes_varargs(takes_varargs), takes_kwargs(takes_kwargs),
-          source(NULL), param_names(param_names) {
+          source(NULL), param_names(param_names), always_use_version(NULL) {
         assert(num_args >= num_defaults);
     }
 
@@ -515,7 +516,7 @@ class BoxedClass;
 void setupRuntime();
 void teardownRuntime();
 BoxedModule* createAndRunModule(const std::string& name, const std::string& fn);
-BoxedModule* createModule(const std::string& name, const std::string& fn);
+BoxedModule* createModule(const std::string& name, const std::string& fn, const char* doc = NULL);
 
 // TODO where to put this
 void appendToSysPath(const std::string& path);

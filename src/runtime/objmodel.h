@@ -94,7 +94,7 @@ extern "C" Box* createBoxedIterWrapperIfNeeded(Box* o);
 extern "C" void dump(void* p);
 
 struct SetattrRewriteArgs;
-void setattrInternal(Box* obj, const std::string& attr, Box* val, SetattrRewriteArgs* rewrite_args);
+void setattrGeneric(Box* obj, const std::string& attr, Box* val, SetattrRewriteArgs* rewrite_args);
 
 struct BinopRewriteArgs;
 extern "C" Box* binopInternal(Box* lhs, Box* rhs, int op_type, bool inplace, BinopRewriteArgs* rewrite_args);
@@ -147,7 +147,15 @@ static const char* objectNewParameterTypeErrorMsg() {
     }
 }
 
-bool exceptionMatches(const ExcInfo& e, BoxedClass* cls);
+// This function will ascii-encode any unicode objects it gets passed, or return the argument
+// unmodified if it wasn't a unicode object.
+// This is intended for functions that deal with attribute or variable names, which we internally
+// assume will always be strings, but CPython lets be unicode.
+// If we used an encoding like utf8 instead of ascii, we would allow collisions between unicode
+// strings and a string that happens to be its encoding.  It seems safer to just encode as ascii,
+// which will throw an exception if you try to pass something that might run into this risk.
+// (We wrap the unicode error and throw a TypeError)
+Box* coerceUnicodeToStr(Box* unicode);
 
 inline std::tuple<Box*, Box*, Box*, Box**> getTupleFromArgsArray(Box** args, int num_args) {
     Box* arg1 = num_args >= 1 ? args[0] : nullptr;
