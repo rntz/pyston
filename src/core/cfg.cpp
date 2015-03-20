@@ -988,14 +988,25 @@ private:
         return rtn;
     }
 
+    AST_arguments* remapArguments(AST_arguments* args) {
+        auto rtn = new AST_arguments();
+        rtn = new AST_arguments();
+        // don't remap args, they're not evaluated. NB. expensive vector copy.
+        rtn->args = args->args;
+        rtn->kwarg = args->kwarg;
+        rtn->vararg = args->vararg;
+        for (auto expr : args->defaults)
+            rtn->defaults.push_back(remapExpr(expr));
+        return rtn;
+    }
+
     AST_expr* remapLambda(AST_Lambda* node) {
-        // Remap in place: see note in visit_functiondef for why.
-
-        for (int i = 0; i < node->args->defaults.size(); i++) {
-            node->args->defaults[i] = remapExpr(node->args->defaults[i]);
-        }
-
-        return node;
+        auto rtn = new AST_Lambda();
+        rtn->body = node->body; // don't remap now; will be CFG'ed later
+        rtn->args = remapArguments(node->args);
+        // lambdas create scope, need to register as replacement
+        scoping_analysis->registerScopeReplacement(node, rtn);
+        return rtn;
     }
 
     AST_expr* remapLangPrimitive(AST_LangPrimitive* node) {
@@ -1326,42 +1337,33 @@ public:
     }
 
     bool visit_classdef(AST_ClassDef* node) override {
-        // Remap in place: see note in visit_functiondef for why.
+        auto rtn = new AST_ClassDef();
+        rtn->name = node->name;
+        rtn->body = node->body; // expensive vector copy
 
-        // Decorators are evaluated before the defaults:
-        for (int i = 0; i < node->decorator_list.size(); i++) {
-            node->decorator_list[i] = remapExpr(node->decorator_list[i]);
-        }
+        // Decorators are evaluated before bases:
+        for (auto expr : node->decorator_list)
+            rtn->decorator_list.push_back(remapExpr(expr));
+        for (auto expr : node->bases)
+            rtn->bases.push_back(remapExpr(expr));
 
-        for (int i = 0; i < node->bases.size(); i++) {
-            node->bases[i] = remapExpr(node->bases[i]);
-        }
-
-        push_back(node);
+        scoping_analysis->registerScopeReplacement(node, rtn);
+        push_back(rtn);
         return true;
     }
 
     bool visit_functiondef(AST_FunctionDef* node) override {
-        // As much as I don't like it, for now we're remapping these in place.
-        // This is because we do certain analyses pre-remapping, and associate the
-        // results with the node.  We can either do some refactoring and have a way
-        // of associating the new node with the same results, or just do the remapping
-        // in-place.
-        // Doing it in-place seems ugly, but I can't think of anything it should break,
-        // so just do that for now.
-        // TODO If we remap these (functiondefs, lambdas, classdefs) in place, we should probably
-        // remap everything in place?
+        auto rtn = new AST_FunctionDef();
+        rtn->name = node->name;
+        rtn->body = node->body; // expensive vector copy
+        // Decorators are evaluated before the defaults, so this *must* go before remapArguments().
+        // TODO(rntz): do we have a test for this
+        for (auto expr : node->decorator_list)
+            rtn->decorator_list.push_back(remapExpr(expr));
+        rtn->args = remapArguments(node->args);
 
-        // Decorators are evaluated before the defaults:
-        for (int i = 0; i < node->decorator_list.size(); i++) {
-            node->decorator_list[i] = remapExpr(node->decorator_list[i]);
-        }
-
-        for (int i = 0; i < node->args->defaults.size(); i++) {
-            node->args->defaults[i] = remapExpr(node->args->defaults[i]);
-        }
-
-        push_back(node);
+        scoping_analysis->registerScopeReplacement(node, rtn);
+        push_back(rtn);
         return true;
     }
 
