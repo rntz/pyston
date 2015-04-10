@@ -643,6 +643,7 @@ void throwCAPIException() {
     raiseExcHelper(SystemError, "error return without exception set");
 }
 
+// TODO(rntz): consider if might be able to optimize this in light of new unwinder
 void checkAndThrowCAPIException() {
     Box* _type = cur_thread_state.curexc_type;
     if (!_type)
@@ -667,6 +668,8 @@ void checkAndThrowCAPIException() {
         PyErr_Clear();
 
         // This is similar to PyErr_NormalizeException:
+        // TODO: why are we doing something "similar" to PyErr_NormalizeException instead of calling
+        // PyErr_NormalizeException?
         if (!isSubclass(value->cls, type)) {
             if (value->cls == tuple_cls) {
                 value = runtimeCall(type, ArgPassSpec(0, 0, true, false), value, NULL, NULL, NULL, NULL);
@@ -679,7 +682,7 @@ void checkAndThrowCAPIException() {
 
         RELEASE_ASSERT(value->cls == type, "unsupported");
 
-        if (tb != None)
+        if (tb != None)         // FIXME why is this here
             raiseRaw(ExcInfo(value->cls, value, tb));
         raiseExc(value);
     }

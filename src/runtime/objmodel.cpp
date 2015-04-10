@@ -4545,7 +4545,7 @@ extern "C" Box* boxedLocalsGet(Box* boxedLocals, const char* attr, Box* globals)
             // If it throws a KeyError, then the variable doesn't exist so move on
             // and check the globals (below); otherwise, just propogate the exception.
             if (!isSubclass(e.value->cls, KeyError)) {
-                throw;
+                throw e;
             }
         }
     }

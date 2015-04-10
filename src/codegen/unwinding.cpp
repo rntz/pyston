@@ -59,14 +59,17 @@ namespace pyston {
 
 // Parse an .eh_frame section, and construct a "binary search table" such as you would find in a .eh_frame_hdr section.
 // Currently only supports .eh_frame sections with exactly one fde.
-void parseEhFrame(uint64_t start_addr, uint64_t size, uint64_t* out_data, uint64_t* out_len) {
+void parseEhFrame(uint64_t start_addr, uint64_t size, uint64_t func_addr, uint64_t* out_data, uint64_t* out_len) {
+    // NB. according to sully, this is not legal C++ - type-punning through unions isn't allowed
+    // FIXME: find compiler flags that warn on this shit and use them; then fix this
     union {
         uint8_t* u8;
         uint32_t* u32;
     };
     u32 = (uint32_t*)start_addr;
 
-    int cie_length = *u32;
+    int32_t cie_length = *u32;
+    assert(cie_length != 0xffffffff); // 0xffffffff would indicate a 64-bit DWARF format
     u32++;
 
     assert(*u32 == 0); // CIE ID
@@ -80,8 +83,10 @@ void parseEhFrame(uint64_t start_addr, uint64_t size, uint64_t* out_data, uint64
 
     int nentries = 1;
     uw_table_entry* table_data = new uw_table_entry[nentries];
-    table_data->start_ip_offset = 0;
-    table_data->fde_offset = 4 + cie_length;
+    // FIXME: set start_ip_offset = offset from eh_frame_addr to start IP of the function!
+    // table_data->start_ip_offset = 0;         // ???
+    table_data->start_ip_offset = func_addr - start_addr; // I think this works?
+    table_data->fde_offset = 4 + cie_length; // ???
 
     *out_data = (uintptr_t)table_data;
     *out_len = nentries;
@@ -156,6 +161,9 @@ public:
 
         assert(g.cur_cf);
 
+        uint64_t the_func_addr;
+        bool the_func_addr_set = false;
+
         llvm_error_code ec;
         for (const auto& sym : Obj.symbols()) {
             llvm::object::SymbolRef::Type SymType;
@@ -193,8 +201,13 @@ public:
                 g.cur_cf->code_start = Addr;
                 g.cur_cf->code_size = Size;
                 cf_registry.registerCF(g.cur_cf);
+
+                // TODO this could be neater
+                assert(!the_func_addr_set);
+                the_func_addr = Addr;
+                the_func_addr_set = true;
             }
-        }
+        } // could probably use this for registering information needed by our unwinder!
 
         // Currently-unused libunwind support:
         llvm_error_code code;
@@ -233,15 +246,19 @@ public:
         unw_dyn_info_t* dyn_info = new unw_dyn_info_t();
         dyn_info->start_ip = text_addr;
         dyn_info->end_ip = text_addr + text_size;
-        dyn_info->format = UNW_INFO_FORMAT_REMOTE_TABLE;
+        // NB. using FORMAT_REMOTE_TABLE forces indirection through an access_mem() callback. a function named
+        // access_mem() shows up in our `perf` results! maybe there's a connection?
+        // but this only applies to JITted code! I think.
+        dyn_info->format = UNW_INFO_FORMAT_REMOTE_TABLE; // ?
 
         dyn_info->u.rti.name_ptr = 0;
-        dyn_info->u.rti.segbase = eh_frame_addr;
-        parseEhFrame(eh_frame_addr, eh_frame_size, &dyn_info->u.rti.table_data, &dyn_info->u.rti.table_len);
+        dyn_info->u.rti.segbase = eh_frame_addr; // am I sure about this?
+        parseEhFrame(eh_frame_addr, eh_frame_size, the_func_addr,
+                     &dyn_info->u.rti.table_data, &dyn_info->u.rti.table_len);
 
         if (VERBOSITY() >= 2)
             printf("dyn_info = %p, table_data = %p\n", dyn_info, (void*)dyn_info->u.rti.table_data);
-        _U_dyn_register(dyn_info);
+        _U_dyn_register(dyn_info); // XXX
 
         // TODO: it looks like libunwind does a linear search over anything dynamically registered,
         // as opposed to the binary search it can do within a dyn_info.
@@ -502,6 +519,62 @@ static const LineInfo* lineInfoForFrame(PythonFrameIteratorImpl& frame_it) {
     return new LineInfo(current_stmt->lineno, current_stmt->col_offset, source->fn, source->getName());
 }
 
+// To produce a traceback, we:
+//
+// 1. Use libunwind to produce a cursor into our stack.
+//
+// 2. For each frame in that stack, we check what function it is from. There are four options:
+//
+//    (a) A JIT-compiled Python function.
+//    (b) ASTInterpreter::execute() in codegen/ast_interpreter.cpp.
+//    (c) generatorEntry() in runtime/generator.cpp
+//    (d) Something else
+//
+//    By cases:
+//
+//    (2a, 2b) If the previous frame we visited was an OSR frame (which we know from its CompiledFunction*), then we
+//    skip this frame (it's the frame we replaced on-stack) and keep unwinding. (FIXME: Why are we guaranteed that we
+//    on-stack-replaced at most one frame?) Otherwise, we found a frame for our traceback! Proceed to step 3.
+//
+//    (2c) Continue unwinding in the stack of whatever called the generator. This involves some hairy munging of
+//    undocumented fields in libunwind structs to swap the context.
+//
+//    (2d) Ignore it and keep unwinding. It's some C or C++ function that we don't want in our traceback.
+//
+// 3. We've found a frame for our traceback, along with a CompiledFunction* and some other information about it.
+//
+//    We grab the current statement it is in (as an AST_stmt*) and use it and the CompiledFunction*'s source info to
+//    produce the line information for the traceback. For JIT-compiled functions, getting the statement involved the
+//    CF's location_map.
+//
+// QUESTIONS:
+// 1. Where does all this information about compiled functions come from?
+//    In particular, what needs to be done to set it up properly/maintain it?
+//    "All this information" being:
+//    (a) the entry_descriptor in CompiledFunction* that tells us whether we're in an OSR function
+//    (b) knowledge about the end address of functions via unw_get_proc_info_by_ip() in getFunctionEnd()
+//    (c) the CompiledFunction* returned by getCFForAddress()
+//
+// 2. How does .eh_frame factor into this?
+// 3. How does libunwind's _U_dyn_register() & co factor into this?
+//
+// 4. How do I tell whether a frame has a C++ exception handler?
+//    - unw_proc_info_t.handler points to a "personality routine".
+//
+// OPEN QUESTION: How should this interface be generalized to allow other stack-walking features, such as:
+// 1. Finding and invoking exception-handlers and finally-blocks
+// 2. Generating the traceback incrementally as CPython does (only including frames between raise & handler)
+// 3. (hypothetically) C++-level debugging of Pyston itself
+// 4. Knowing when we unwind through an IC and doing the appropriate thing
+//    (in particular, decrementing the "threads in this IC" counter)
+//
+// OPEN QUESTION: If I didn't want to use C++ exceptions, how could I communicate exception-handling information to the
+//   unwinder?
+// - Maybe I can set unw_proc_info_t.handler and/or unw_proc_info_t.lsd?
+//   Not sure where that information ultimately comes from, though.
+//
+// TODO: run unwindExc() under gdb and compare the things it touches to gdb's traceback.
+// TODO: try breaking on a personality function and then raising a C++ exception!
 static StatCounter us_gettraceback("us_gettraceback");
 BoxedTraceback* getTraceback() {
     if (!ENABLE_FRAME_INTROSPECTION) {

@@ -75,6 +75,7 @@ bool ENABLE_TYPE_FEEDBACK = 1 && _GLOBAL_ENABLE;
 bool ENABLE_RUNTIME_ICS = 1 && _GLOBAL_ENABLE;
 bool ENABLE_JIT_OBJECT_CACHE = 1 && _GLOBAL_ENABLE;
 
+// TODO(rntz): do we ever not want to have frame introspection? should we remove this option?
 bool ENABLE_FRAME_INTROSPECTION = 1;
 bool BOOLS_AS_I64 = ENABLE_FRAME_INTROSPECTION;
 

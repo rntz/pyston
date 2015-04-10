@@ -9,8 +9,8 @@ with open('/dev/null')as ignore:
     def run(args):
         code = 0 == subprocess.call([me] + args, stderr=ignore)
         sys.stdout.flush()
-        sys.stderr.flush()
         print code
+        sys.stdout.flush()
 
     run(["-c", "print 2 + 2"])
     run(["-c", "import sys; print sys.argv", "hello", "world"])

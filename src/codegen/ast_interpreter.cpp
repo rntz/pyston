@@ -76,6 +76,11 @@ public:
 
     void initArguments(int nargs, BoxedClosure* closure, BoxedGenerator* generator, Box* arg1, Box* arg2, Box* arg3,
                        Box** args);
+
+    // FIXME XXX(rntz): must be marked no-inline.
+    //
+    // this must be no-inline because we rely on being able to detect when we're inside of it during a stack-trace in
+    // order to produce tracebacks inside interpreted code.
     static Value execute(ASTInterpreter& interpreter, CFGBlock* start_block = NULL, AST_stmt* start_at = NULL);
 
 private:
@@ -265,6 +270,11 @@ void ASTInterpreter::initArguments(int nargs, BoxedClosure* _closure, BoxedGener
     }
 }
 
+// Map from stack frame pointers for frames corresponding to ASTInterpreter::execute() to the ASTInterpreter handling
+// them. Used to look up information about that frame. This is used for getting tracebacks. I think it's also used for
+// CPython introspection (sys._getframe & co).
+//
+// TODO: get kmod to check this is an accurate description
 static std::unordered_map<void*, ASTInterpreter*> s_interpreterMap;
 static_assert(THREADING_USE_GIL, "have to make the interpreter map thread safe!");
 
@@ -285,6 +295,8 @@ public:
 Value ASTInterpreter::execute(ASTInterpreter& interpreter, CFGBlock* start_block, AST_stmt* start_at) {
     threading::allowGLReadPreemption();
 
+    // NB. we rely on __builtin_frame_address getting our /base pointer/. See e.g. PythonFrameIterator::incr() in
+    // codegen/unwinding.cpp.
     void* frame_addr = __builtin_frame_address(0);
     RegisterHelper frame_registerer(&interpreter, frame_addr);
 

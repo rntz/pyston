@@ -30,6 +30,8 @@ namespace pyston {
 
 int Timer::level = 0;
 
+Timer::Timer(long min_usec) : min_usec(min_usec), ended(true) {}
+
 Timer::Timer(const char* desc, long min_usec) : min_usec(min_usec), ended(true) {
     restart(desc);
 }

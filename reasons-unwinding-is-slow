@@ -1,0 +1,193 @@
+* Goals
+1. make unwinding faster
+2. make tracebacks behave as they do in CPython
+3. have a nicer API for hook into exception handling
+   (nicer than writing our own .eh_frame sections!)
+   USE: make unwinding through ICs decrement their count appropriately
+   USE: baseline JIT
+
+baseline JIT possible interface:
+- "in this code region, all exceptions go here"
+
+* OPTIONS FOR BIG PICTURE
+** the TRILEMMA
+1. efficient, simple unwinder
+   at the cost of: no RAII, no C++ exceptions
+   probably possible to runtime-check lack of RAII, just to make sure we don't fuck up
+2. complex, hard-to-port unwinder that might not be efficient
+   because: it has to reimplement parts of C++ ABI to do RAII
+3. return-code based exceptions
+(4. stick with C++ unwinder and hack incremental tracebacks w/ RAII. not clear how we could do baseline JIT!)
+
+** Option 1: libunwind-based unwinder
+how do we do baseline JIT?
+
+** Option 2: completely custom unwinder
+possible pro?: can avoid restoring callee-save registers
+
+how does this work with C++ exceptions?
+
+** Option 3: stick with C++ unwinder
+- need to patch libgcc to use binary search over objects
+  look at the rejected patch earlier!
+- how to do incremental backtraces? hack RAII!
+- how do we do baseline JIT?
+  give better interface to outputting DWARF.
+
+** Option 4: return-code-based exceptions
+this lets us keep RAII and also avoid implementing our own unwinder
+it might well be fast enough!
+still need unwinding for introspection, but that's much easier
+no need to deal with C++ ABI garbage
+
+* PLAN
+1. acquire benchmarks / performance tests
+   poke toshok, grab marius' thing, write my own
+
+2. write libunwind-based unwinder that apes C++ ABI sufficiently to work
+   then instrument it to see how much time is spent unwinding
+
+3. compare throw-unwinding with libunwind-unwinding
+   if they're very different, think about why & what this means
+
+4? implement incremental exceptions with libunwind-based unwinder
+   then compare performance
+
+5? gather detailed performance data to decide where to go next
+
+* meeting agenda
+- what are our goals?
+- how do I measure performance?
+- give list of reasons, ask kmod comments. kmod think list is complete?
+- review options for making find_fde faster
+  - patch libgcc (NOPE)
+  - patch libunwind (or LLVM's libuwind)
+  - custom registry
+- ask how OSR frames work / where to look for that
+  - looks like we *can* have multiple OSR frames in a row
+    normal -> replaced by optimized -> replaced by even more optimized
+    have test for this?
+
+- how feasible is avoiding C++ exceptions and RAII inside Pyston entirely?
+  not very.
+
+TODO: measure performance! ask kmod how to measure things! ask toshok how he measured the django stuff.
+TODO: ask kmod exactly what stuff we need to do for ICs. how much control?
+
+* Reasons unwinding is slow
+1. JITting causes lots of objects to get emitted
+   this makes _Unwind_Find_FDE slow
+   because libgcc does a linear scan over all objects
+   this could be sped up with a binary search (since objects are non-overlapping in memory)
+
+   evidence: django perf traces
+
+2. libunwind unwinding is slow
+   maybe because it needs to reconstruct frame state?
+   we need this for introspection (finding local variables, etc.) but not for unwinding
+   do we need it for exception handling?
+
+   maybe because we're using FORMAT_REMOTE_INFO? but that only applies to JITted code.
+
+   libunwind uses dwarf unwinding, falls back to rbp unwinding, maybe could force rbp unwinding
+
+   evidence: marius' patch and small test
+
+3. We trace the whole stack rather than just the part between exception & catch.
+   this *might* be the reason getTraceback() is slow.
+   (This also results in non-CPython-equivalent tracebacks.)
+   we SHOULD be able to fix this with unwindExc.
+
+   no concrete evidence re perf. how can we measure this?
+   how can we test whether this or (2) is the reason getTraceback() is slow?
+
+4. We do C++ two-phase search when we don't need to.
+   we call the personality function, maybe we can avoid?
+   we SHOULD be able to fix this with unwindExc.
+   no concrete evidence re perf. how can we measure this?
+
+5. We allocate space for an exception with malloc() b/c C++ needs it.
+   we PROBABLY CAN'T fix this with unwindExc.
+   no concrete evidence re perf. how can we measure this?
+
+** perf question: what gets done for each frame
+- look through objects & FDEs to find debug info for IP
+
+the wonderful thing about return-code-based exceptions
+is that you don't need to do any side-lookup: what to do is right there in the code!
+
+* Measuring?
+`perf` command - sometimes gets confused with exceptions
+`make perf_TEST_NAME`
+
+StatCounter class
+Timer class, Timer.end() returns a time, need to feed into counter
+`pyston -s` shows counters
+
+* ISSUE: How do deal with _Unwind_Find_FDE?
+Q: in our codebase actually calls/cause the call to _Unwind_Find_FDE?
+A: "throw" in raiseExc*, of course!
+
+Q: If we replaced this by a custom libunwind-based unwinder, do we still use _Unwind_Find_FDE?
+A: Maybe. It's not clear exactly how libunwind finds the information it needs.
+
+for JITted code, _U_dyn_register replaces __frame_register, so we're using libunwind's internal structures instead of
+gcc's. however, that's also a linked list.
+
+* QUESTION: does exception-unwinding need to know register states & things like that?
+maybe? for resuming exception handlers, I think.
+
+* BIG PLAN
+1. replace "throw" with unwindExc
+2. fix slow linear scan in _Unwind_Find_FDE (somehow)
+
+** replace "throw" with unwindExc
+1. figure out how to invoke personality routine for cleanup
+2. generate tracebacks incrementally, remove getTraceback()
+3. optimize?
+   - can we dispense with libunwind & use rbp-based unwinding?
+   - can we get libunwind to do rbp-based unwinding?
+
+might need to adapt PythonFrameIterator code
+
+** fix slow linear scan in _Unwind_Find_FDE
+options:
+1. patch libgcc (HARD) - might not work once we use libunwind-based unwinder
+2. patch libunwind's _Unwind_register_dynamic (MEDIUM)
+3. write our own registerer (MEDIUM)
+   might be able to "try libunwind and bail out to our own registerer" (EASY)
+   or we might have to replace libunwind entirely (HARD)
+
+* POSSIBLE FUTURE PROBLEMS
+what if libunwind unwinding is too slow?
+
+* @toshok: we might be able to force llvm to use whatever our unwind system is:
+
+  InstallExceptionTableRegister(__register_frame);
+  InstallExceptionTableDeregister(__deregister_frame);
+
+On Linux, __register_frame seems to be passed a pointer to the start of the .eh_frame section.
+On OS X apparently it gets called on a single FDE.
+http://llvm.org/docs/doxygen/html/RTDyldMemoryManager_8cpp_source.html
+https://github.com/gcc-mirror/gcc/blob/gcc-4_9-branch/libgcc/unwind-dw2-fde.c#L110
+
+* What do we use unwinding for?
+- exceptions
+- getTraceback(), but this will go away / be rolled into exception handling
+- introspection
+
+Introspection doesn't need to be fast. Throwing exceptions does.
+
+The complication in throwing exceptions is handling them. How much information do we need to restore state when handling
+exceptions? Can we do it efficiently while staying "close enough" to the C++ protocol to reuse LLVM's support and the
+throw/catch statements?
+
+* Burning questions
+where is our slowness coming from?
+- unwind_find_fde?
+- the need to restore register state & such?
+- dealing with DWARF info?
+- C++ two-phase search?
+
+this informs whether we can just optimize finding FDEs
+whether we need a custom unwinder

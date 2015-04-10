@@ -212,7 +212,7 @@ extern "C" Box* next(Box* iterator, Box* _default) {
     } catch (ExcInfo e) {
         if (_default && e.matches(StopIteration))
             return _default;
-        throw;
+        throw e;
     }
 }
 
@@ -813,6 +813,7 @@ Box* print(BoxedTuple* args, BoxedDict* kwargs) {
     Box* space_box = boxStrConstant(" ");
 
     // TODO softspace handling?
+    // TODO: duplicates code with ASTInterpreter::visit_print()
     bool first = true;
     for (auto e : *args) {
         BoxedString* s = str(e);

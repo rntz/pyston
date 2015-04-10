@@ -88,6 +88,13 @@ static bool handle_toplevel_exn(const ExcInfo& e, int* retcode) {
 }
 
 static int main(int argc, char** argv) {
+    if (0) {                    // keep this off by default, since it changes our behavior versus CPython
+        // Force stdout, stderr to be line-buffered. This makes debugging easier when piping things to another file or
+        // program; it avoids undesired interleavings.
+        setlinebuf(stdout);
+        setlinebuf(stderr);
+    }
+
     Timer _t("for jit startup");
     // llvm::sys::PrintStackTraceOnErrorSignal();
     // llvm::PrettyStackTraceProgram X(argc, argv);
