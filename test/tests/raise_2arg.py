@@ -1,3 +1,4 @@
+# expected: fail
 # two-argument `raise' statements where second argument is itself an exception
 class A(Exception): pass
 class B(Exception): pass

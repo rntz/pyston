@@ -1,3 +1,4 @@
+# should_error
 import sys
 
 class A(Exception):
