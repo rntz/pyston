@@ -1,31 +1,42 @@
 from __builtin__ import Exception
 
+# configuration
 NUM_ITERS = 100 * 1000
-RECURSE_DEPTH = 10
+WRAPPER_DEPTH = 10
+RECURSE_DEPTH = 0
 
-e = Exception()
+# exception code
 counter = 0
+e = Exception("bad wrong")
 
 def gtor():
-    raise e
     yield 1
+    raise e
+    yield 2
 
-def raiser(n=RECURSE_DEPTH):
+def wrapper(n=WRAPPER_DEPTH):
     global counter
     if n:
         try:
-            raiser(n-1)
+            wrapper(n-1)
         finally:
             counter += 1
     else:
-        g = gtor()
-        g.next()
+        for x in gtor():
+            pass
+
+def recurser(n=RECURSE_DEPTH):
+    if n:
+        return recurser(n-1)
+    else:
+        return wrapper()
 
 def f(niters):
     for i in xrange(niters):
         try:
-            raiser()
-        except Exception:
+            recurser()
+        except Exception, e:
             pass
 
+# run the function
 f(NUM_ITERS)
