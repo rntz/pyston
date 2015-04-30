@@ -26,6 +26,8 @@
 
 namespace pyston {
 
+#if !DISABLE_TIMERS
+
 int Timer::level = 0;
 
 Timer::Timer(const char* desc, long min_usec) : min_usec(min_usec), ended(true) {
@@ -83,6 +85,8 @@ Timer::~Timer() {
             exit_callback(t);
     }
 }
+
+#endif  // !DISABLE_TIMERS
 
 bool startswith(const std::string& s, const std::string& pattern) {
     if (pattern.size() > s.size())

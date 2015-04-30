@@ -24,6 +24,9 @@
 
 namespace pyston {
 
+#define DISABLE_TIMERS 0
+
+#if !DISABLE_TIMERS
 class Timer {
 private:
     static int level;
@@ -49,6 +52,22 @@ public:
         return rtn;
     }
 };
+
+#else  // DISABLE_TIMERS
+class Timer {
+  public:
+    Timer(const char* desc = NULL, long min_usec = -1) {}
+
+    void setExitCallback(std::function<void(long)> _exit_callback) {}
+
+    void restart(const char* newdesc, long new_min_usec) {}
+    void restart(const char* newdesc = NULL) {}
+
+    long end() { return 0; }
+    long split(const char* newdesc = NULL) { return 0; }
+};
+
+#endif  // #else DISABLE_TIMERS
 
 bool startswith(const std::string& s, const std::string& pattern);
 bool endswith(const std::string& s, const std::string& pattern);
