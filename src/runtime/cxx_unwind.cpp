@@ -346,15 +346,9 @@ void print_frame(unw_cursor_t* cursor, const unw_proc_info_t* pip) {
     }
 
     if (frame_type == INTERPRETED && cf && cur_stmt) {
-        auto source = cf->clfunc->source;
+        auto source = cf->clfunc->source.get();
         // FIXME: dup'ed from lineInfoForFrame
-        const std::string* fn = &source->parent_module->fn;
-        if (source->ast->type == AST_TYPE::Suite /* exec */ || source->ast->type == AST_TYPE::Expression /* eval */) {
-            static const std::string string_str("<string>");
-            fn = &string_str;
-        }
-
-        LineInfo line(cur_stmt->lineno, cur_stmt->col_offset, *fn, source->getName());
+        LineInfo line(cur_stmt->lineno, cur_stmt->col_offset, source->fn, source->getName());
         printf("      File \"%s\", line %d, in %s\n", line.file.c_str(), line.line, line.func.c_str());
     }
 }
