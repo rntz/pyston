@@ -83,12 +83,21 @@ template <typename T> static inline void check(T x) {
 
 namespace pyston {
 
+// Timer that auto-logs.
+struct LogTimer {
+    StatCounter& counter;
+    Timer timer;
+
+    LogTimer(const char *desc, StatCounter& ctr) : counter(ctr), timer(desc) {}
+    ~LogTimer() { counter.log(timer.end()); }
+};
+
 static StatCounter us_unwind_loop("us_unwind_loop");
-// static StatCounter us_unwind_catch("us_unwind_catch"); // TODO
 static StatCounter us_unwind_resume_catch("us_unwind_resume_catch");
 static StatCounter us_unwind_cleanup("us_unwind_cleanup");
-static StatCounter us_unwind_step("us_unwind_step");                   // TODO
 static StatCounter us_unwind_get_proc_info("us_unwind_get_proc_info");
+static StatCounter us_unwind_step("us_unwind_step");                   // TODO
+static StatCounter us_unwind_find_call_site_entry("us_unwind_find_call_site_entry");
 
 // do these need to be separate timers? might as well
 static thread_local Timer per_thread_resume_catch_timer(-1);
@@ -471,6 +480,11 @@ int64_t determine_action(const lsda_info_t* info, const call_site_entry_t *entry
     RELEASE_ASSERT(0, "action chain exhausted and no cleanup indicated");
 }
 
+static inline int step(unw_cursor_t *cp) {
+    LogTimer t("unw_step", us_unwind_step);
+    return unw_step(cp);
+}
+
 // The stack-unwinding loop.
 // TODO: integrate incremental traceback generation into this function
 static
@@ -487,16 +501,15 @@ void unwind_loop(const ExcInfo *exc_info) {
     }
 
     // TODO?: need to handle unwinding through generator frames?
-    while (unw_step(&cursor) > 0) {
+    while (step(&cursor) > 0) {
         unw_proc_info_t pip;
         {
             // as it turns out, unw_get_proc_info is REALLY SLOW
             // things to try: registering JITted procs as local_table_info instead of remote?
             // but it seems like mostly it's just slow and there's no good way around it :(
             // should figure out what in particular is slow
-            Timer t_procinfo("get_proc_info");
+            LogTimer t_procinfo("get_proc_info", us_unwind_get_proc_info);
             check(unw_get_proc_info(&cursor, &pip));
-            us_unwind_get_proc_info.log(t_procinfo.end());
         }
         assert((pip.lsda == 0) == (pip.handler == 0));
         assert(pip.flags == 0);
@@ -522,22 +535,26 @@ void unwind_loop(const ExcInfo *exc_info) {
         lsda_info_t info;
         parse_lsda_header(&pip, &info);
 
-        // 2. Find our current IP in the call site table.
-        unw_word_t ip;
-        unw_get_reg(&cursor, UNW_REG_IP, &ip);
-        // ip points to the instruction *after* the instruction that caused the error - which is generally (always?) a call
-        // instruction - UNLESS we're in a signal frame, in which case it points at the instruction that caused the error.
-        // For now, we assume we're never in a signal frame. So, we decrement it by one.
-        //
-        // TODO: can this code ever get called on a signal frame?
-        --ip;
-
         call_site_entry_t entry;
-        bool found = find_call_site_entry(&info, (const uint8_t*)ip, &entry);
-        // If we didn't find an entry, an exception happened somewhere exceptions should never happen; terminate
-        // immediately.
-        if (!found) {
-            panic();
+        {
+            LogTimer t_call_site("find_call_site_entry", us_unwind_find_call_site_entry);
+
+            // 2. Find our current IP in the call site table.
+            unw_word_t ip;
+            unw_get_reg(&cursor, UNW_REG_IP, &ip);
+            // ip points to the instruction *after* the instruction that caused the error - which is generally (always?) a call
+            // instruction - UNLESS we're in a signal frame, in which case it points at the instruction that caused the error.
+            // For now, we assume we're never in a signal frame. So, we decrement it by one.
+            //
+            // TODO: can this code ever get called on a signal frame?
+            --ip;
+
+            bool found = find_call_site_entry(&info, (const uint8_t*)ip, &entry);
+            // If we didn't find an entry, an exception happened somewhere exceptions should never happen; terminate
+            // immediately.
+            if (!found) {
+                panic();
+            }
         }
 
         // 3. Figure out what to do based on the call site entry.
