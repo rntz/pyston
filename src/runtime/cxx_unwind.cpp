@@ -586,6 +586,9 @@ static
 void unwind(void) {
     ExcInfo *e = (ExcInfo*) &cur_thread_state.pyston_exception_ferry;
     assert(e->type && e->value && e->traceback);
+    if (false && e->value->hasattr("magic_break")) {
+        printf("MAGIC_BREAK\n");
+    }
     unwind_loop(e);
     // unwind_loop returned, couldn't find any handler. ruh-roh.
     panic();

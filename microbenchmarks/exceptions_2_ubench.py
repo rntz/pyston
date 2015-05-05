@@ -1,13 +1,14 @@
 from __builtin__ import Exception
 
 # configuration
-NUM_ITERS = 100 * 1000
+NUM_ITERS = 10 * 1000
 WRAPPER_DEPTH = 10
 RECURSE_DEPTH = 0
 
 # exception code
 counter = 0
 e = Exception("bad wrong")
+e.magic_break = True
 
 def gtor():
     yield 1
