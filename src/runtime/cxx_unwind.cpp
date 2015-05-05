@@ -136,7 +136,7 @@ struct call_site_entry_t {
 
 
 // ---------- Parsing stuff ----------
-static void parse_lsda_header(const unw_proc_info_t* pip, lsda_info_t* info) {
+static inline void parse_lsda_header(const unw_proc_info_t* pip, lsda_info_t* info) {
     const uint8_t *ptr = (const uint8_t*) pip->lsda;
 
     // 1. Read the landing pad base pointer.
@@ -176,7 +176,9 @@ static void parse_lsda_header(const unw_proc_info_t* pip, lsda_info_t* info) {
     info->action_table = ptr + call_site_table_nbytes;
 }
 
-static const uint8_t *parse_call_site_entry(const uint8_t *ptr, const lsda_info_t *info, call_site_entry_t *entry) {
+__attribute__((__always_inline__))
+static inline const uint8_t *parse_call_site_entry(const uint8_t *ptr, const lsda_info_t *info,
+                                                   call_site_entry_t *entry) {
     uint64_t instrs_start_offset, instrs_len_bytes, landing_pad_offset, action_offset_plus_one;
 
     // TODO: think about how this whole file should work on 32-bit platforms!
@@ -364,7 +366,8 @@ void print_frame(unw_cursor_t* cursor, const unw_proc_info_t* pip) {
 
 
 // ---------- Helpers for unwind_loop ----------
-static
+__attribute__((__always_inline__))
+static inline
 bool find_call_site_entry(const lsda_info_t* info, const uint8_t *ip, call_site_entry_t* entry) {
     const uint8_t *p = info->call_site_table;
     // The call site table ends where the action table begins.
@@ -391,7 +394,7 @@ bool find_call_site_entry(const lsda_info_t* info, const uint8_t *ip, call_site_
     return false;
 }
 
-static NORETURN
+static inline NORETURN
 void resume(unw_cursor_t* cursor, const uint8_t *landing_pad, int64_t switch_value, const ExcInfo *exc_info) {
     assert(landing_pad);
     if (VERBOSITY("cxx_unwind") >= 2)
@@ -431,7 +434,7 @@ void resume(unw_cursor_t* cursor, const uint8_t *landing_pad, int64_t switch_val
 //
 // Returns the switch value to be passed into the landing pad, which selects which handler gets run in the case of
 // multiple `catch' blocks, or is 0 to run cleanup code.
-static
+static inline
 int64_t determine_action(const lsda_info_t* info, const call_site_entry_t *entry) {
     // No action means there are destructors/cleanup to run, but no exception handlers.
     const uint8_t *p = first_action(info, entry);
@@ -487,7 +490,7 @@ static inline int step(unw_cursor_t *cp) {
 
 // The stack-unwinding loop.
 // TODO: integrate incremental traceback generation into this function
-static
+static inline
 void unwind_loop(const ExcInfo *exc_info) {
     Timer t("unwind_loop");
 
