@@ -1,9 +1,10 @@
 from __builtin__ import Exception
 
 # configuration
-NUM_ITERS = 10 * 1000
+NUM_ITERS = 100 * 1000
 WRAPPER_DEPTH = 10
 RECURSE_DEPTH = 0
+TRACEBACK_DEPTH = 0
 
 # exception code
 counter = 0
@@ -32,12 +33,16 @@ def recurser(n=RECURSE_DEPTH):
     else:
         return wrapper()
 
-def f(niters):
-    for i in xrange(niters):
-        try:
-            recurser()
-        except Exception, e:
-            pass
+def f(niters, traceback_depth=TRACEBACK_DEPTH):
+    global counter
+    if traceback_depth:
+        f(niters, traceback_depth - 1)
+    else:
+        for i in xrange(niters):
+            try:
+                recurser()
+            except Exception:
+                counter = 0
 
 # run the function
 f(NUM_ITERS)
