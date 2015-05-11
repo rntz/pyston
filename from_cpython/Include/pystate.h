@@ -119,11 +119,6 @@ typedef struct _ts {
     PyObject *curexc_value;
     PyObject *curexc_traceback;
 
-    // See runtime/cxx_unwind.cpp for an explanation of why we need this.
-    struct Pyston_Exception_Ferry {
-        PyObject *type, *value, *traceback;
-    } pyston_exception_ferry;
-
     PyObject *dict;  /* Stores per-thread state */
 
     // Pyston note: additions in here need to be mirrored in ThreadStateInternal::accept

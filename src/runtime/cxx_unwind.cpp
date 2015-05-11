@@ -83,6 +83,8 @@ template <typename T> static inline void check(T x) {
 
 namespace pyston {
 
+thread_local ExcInfo exception_ferry(nullptr, nullptr, nullptr);
+
 // Timer that auto-logs.
 struct LogTimer {
     StatCounter& counter;
@@ -584,9 +586,8 @@ void unwind_loop(const ExcInfo *exc_info) {
 // The unwinder entry-point.
 static
 void unwind(void) {
-    ExcInfo *e = (ExcInfo*) &cur_thread_state.pyston_exception_ferry;
-    assert(e->type && e->value && e->traceback);
-    unwind_loop(e);
+    assert(exception_ferry.type && exception_ferry.value && exception_ferry.traceback);
+    unwind_loop(&exception_ferry);
     // unwind_loop returned, couldn't find any handler. ruh-roh.
     panic();
 }
@@ -627,17 +628,6 @@ void _Unwind_Resume(struct _Unwind_Exception *_exc) {
 
 // C++ ABI functionality
 namespace __cxxabiv1 {
-
-// Hack: We perform a type pun between Pyston_Exception_Ferry, defined in from_cpython/Include/pystate.h, and ExcInfo,
-// defined in src/core/types.h. These static assert checks that this is reasonable.
-static_assert(sizeof(pyston::ExcInfo) == sizeof(PyThreadState::Pyston_Exception_Ferry),
-              "ExcInfo does not match Pyston_Exception_Ferry");
-static_assert(offsetof(pyston::ExcInfo, type) == offsetof(PyThreadState::Pyston_Exception_Ferry, type),
-              "ExcInfo does not match Pyston_Exception_Ferry");
-static_assert(offsetof(pyston::ExcInfo, value) == offsetof(PyThreadState::Pyston_Exception_Ferry, value),
-              "ExcInfo does not match Pyston_Exception_Ferry");
-static_assert(offsetof(pyston::ExcInfo, traceback) == offsetof(PyThreadState::Pyston_Exception_Ferry, traceback),
-              "ExcInfo does not match Pyston_Exception_Ferry");
 
 // TODO?: maybe we should actually use the `exc_obj' pointer passed through all these procedures instead of poisoning it
 // and using cur_thread_state every time?
@@ -681,7 +671,7 @@ void *__cxa_allocate_exception(size_t size) noexcept {
     //
     // There might be some clever way to signal to __cxa_end_catch that we're unwinding and shouldn't wipe the exception
     // info. This seems simpler. TODO: think about this.
-    return (void*) &cur_thread_state.pyston_exception_ferry;
+    return (void*) &pyston::exception_ferry;
 }
 
 // This function is supposed to return a pointer to the exception value actually thrown. So if we threw an ExcInfo, this
@@ -706,11 +696,8 @@ void *__cxa_begin_catch(void *exc_obj_in) noexcept {
         printf("***** __cxa_begin_catch() *****\n");
 
     // Hack: we pun a pointer into PyThreadState.pyston_exception_ferry as a pyston::ExcInfo*.
-    PyThreadState::Pyston_Exception_Ferry *ferry = &cur_thread_state.pyston_exception_ferry;
-    pyston::ExcInfo *e = (pyston::ExcInfo*)ferry;
-    assert(e->type == ferry->type && e->value == ferry->value && e->traceback == ferry->traceback);
+    pyston::ExcInfo *e = &pyston::exception_ferry;
     assert(e->type && e->value && e->traceback);
-
     return (void*) e;
 }
 
@@ -743,7 +730,7 @@ void __cxa_throw(void *exc_obj, std::type_info *tinfo, void (*dtor)(void*)) {
     if (VERBOSITY("cxx_unwind"))
         printf("***** __cxa_throw() *****\n");
 
-    ASSERT(exc_obj == (void*) &cur_thread_state.pyston_exception_ferry,
+    ASSERT(exc_obj == (void*) &pyston::exception_ferry,
            "throwing exception not allocated on the Pyston exception ferry");
 
     pyston::unwind();
@@ -752,10 +739,11 @@ void __cxa_throw(void *exc_obj, std::type_info *tinfo, void (*dtor)(void*)) {
 extern "C"
 void *__cxa_get_exception_ptr(void *exc_obj_in) noexcept {
     assert((uintptr_t) exc_obj_in == RAX_POISON_VALUE);
-    assert(cur_thread_state.pyston_exception_ferry.type
-           && cur_thread_state.pyston_exception_ferry.value
-           && cur_thread_state.pyston_exception_ferry.traceback);
-    return (void*)&cur_thread_state.pyston_exception_ferry;
+    assert(pyston::exception_ferry.type
+           && pyston::exception_ferry.value
+           && pyston::exception_ferry.traceback);
+
+    return (void*) &pyston::exception_ferry;
 }
 
 // We deliberately don't implement rethrowing because we can't implement it correctly with our current strategy for
