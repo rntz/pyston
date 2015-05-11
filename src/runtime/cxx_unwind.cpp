@@ -413,13 +413,13 @@ void resume(unw_cursor_t* cursor, const uint8_t *landing_pad, int64_t switch_val
 #endif
     }
 
-    // set rax to POISON_VALUE, because we don't use it.
+    // set rax to pointer to exception ferry
     // set rdx to the switch_value (0 for cleanup, otherwise an index indicating which exception handler to use)
     //
     // TODO: assumes x86-64!
     // maybe I should use __builtin_eh_return_data_regno() here?
     // but then, need to translate into UNW_* values somehow. not clear how.
-    check(unw_set_reg(cursor, UNW_X86_64_RAX, RAX_POISON_VALUE));
+    check(unw_set_reg(cursor, UNW_X86_64_RAX, (unw_word_t) &exception_ferry));
     check(unw_set_reg(cursor, UNW_X86_64_RDX, switch_value));
 
     // resume!
@@ -621,7 +621,7 @@ void _Unwind_Resume(struct _Unwind_Exception *_exc) {
     if (VERBOSITY("cxx_unwind"))
         printf("***** _Unwind_Resume() *****\n");
     // we give `_exc' type `struct _Unwind_Exception*' because unwind.h demands it; it's not actually accurate
-    assert((uintptr_t)_exc == RAX_POISON_VALUE); // double-check
+    assert((void*)_exc == (void*)&pyston::exception_ferry); // double-check
     pyston::unwind();
 }
 
@@ -686,7 +686,7 @@ void *__cxa_allocate_exception(size_t size) noexcept {
 // volatile.
 extern "C"
 void *__cxa_begin_catch(void *exc_obj_in) noexcept {
-    assert((uintptr_t)exc_obj_in == RAX_POISON_VALUE); // double-check
+    assert(exc_obj_in == &pyston::exception_ferry); // double-check
 
     pyston::us_unwind_resume_catch.log(pyston::per_thread_resume_catch_timer.end());
 
@@ -735,7 +735,7 @@ void __cxa_throw(void *exc_obj, std::type_info *tinfo, void (*dtor)(void*)) {
 
 extern "C"
 void *__cxa_get_exception_ptr(void *exc_obj_in) noexcept {
-    assert((uintptr_t) exc_obj_in == RAX_POISON_VALUE);
+    assert(exc_obj_in == &pyston::exception_ferry);
     assert(pyston::exception_ferry.type
            && pyston::exception_ferry.value
            && pyston::exception_ferry.traceback);
