@@ -89,7 +89,7 @@ struct LogTimer {
     StatCounter& counter;
     Timer timer;
 
-    LogTimer(const char *desc, StatCounter& ctr) : counter(ctr), timer(desc) {}
+    LogTimer(const char *desc, StatCounter& ctr, long min_usec = -1) : counter(ctr), timer(desc, min_usec) {}
     ~LogTimer() { counter.log(timer.end()); }
 };
 
@@ -403,11 +403,11 @@ void resume(unw_cursor_t* cursor, const uint8_t *landing_pad, int64_t switch_val
 
     if (0 != switch_value) {
         // The exception handler will call __cxa_begin_catch, which stops this timer and logs it.
-        per_thread_resume_catch_timer.restart("resume_catch");
+        per_thread_resume_catch_timer.restart("resume_catch", 20);
     } else {
         // The cleanup code will call _Unwind_Resume, which will stop this timer and log it.
         // TODO: am I sure cleanup code can't raise exceptions? maybe have an assert!
-        per_thread_cleanup_timer.restart("cleanup");
+        per_thread_cleanup_timer.restart("cleanup", 20);
 #ifndef NDEBUG
         in_cleanup_code = true;
 #endif
@@ -485,7 +485,7 @@ int64_t determine_action(const lsda_info_t* info, const call_site_entry_t *entry
 }
 
 static inline int step(unw_cursor_t *cp) {
-    LogTimer t("unw_step", us_unwind_step);
+    LogTimer t("unw_step", us_unwind_step, 5);
     return unw_step(cp);
 }
 
@@ -493,7 +493,7 @@ static inline int step(unw_cursor_t *cp) {
 // TODO: integrate incremental traceback generation into this function
 static inline
 void unwind_loop(const ExcInfo *exc_info) {
-    Timer t("unwind_loop");
+    Timer t("unwind_loop", 50);
 
     // NB. https://monoinfinito.wordpress.com/series/exception-handling-in-c/ is a very useful resource
     // as are http://www.airs.com/blog/archives/460 and http://www.airs.com/blog/archives/464
@@ -512,7 +512,7 @@ void unwind_loop(const ExcInfo *exc_info) {
             // things to try: registering JITted procs as local_table_info instead of remote?
             // but it seems like mostly it's just slow and there's no good way around it :(
             // should figure out what in particular is slow
-            LogTimer t_procinfo("get_proc_info", us_unwind_get_proc_info);
+            LogTimer t_procinfo("get_proc_info", us_unwind_get_proc_info, 10);
             check(unw_get_proc_info(&cursor, &pip));
         }
         assert((pip.lsda == 0) == (pip.handler == 0));
@@ -541,7 +541,7 @@ void unwind_loop(const ExcInfo *exc_info) {
 
         call_site_entry_t entry;
         {
-            LogTimer t_call_site("find_call_site_entry", us_unwind_find_call_site_entry);
+            LogTimer t_call_site("find_call_site_entry", us_unwind_find_call_site_entry, 10);
 
             // 2. Find our current IP in the call site table.
             unw_word_t ip;
