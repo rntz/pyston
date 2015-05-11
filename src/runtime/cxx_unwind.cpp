@@ -27,7 +27,7 @@
 // An action of 0 in the LSDA action table indicates cleanup.
 #define CLEANUP_ACTION 0
 
-// Taken from unwind-pe.h
+// Dwarf encoding modes.
 #define DW_EH_PE_absptr         0x00
 #define DW_EH_PE_omit           0xff
 
@@ -48,7 +48,6 @@
 #define DW_EH_PE_aligned        0x50
 
 #define DW_EH_PE_indirect	0x80
-// end taken from unwind-pe.h
 
 // TODO: given that we're reimplementing a bunch of the C++ ABI, what happens if `new' fails, for example?
 // we're assuming we only ever throw Python/Pyston exceptions, but that might be a bad assumption!
@@ -64,8 +63,8 @@
 // - the landingpad code will call __cxa_begin_catch, __cxa_end_catch, and _Unwind_Resume
 //   as appropriate. (How do I know they won't get inlined? That would be bad.)
 //
-//   it will also call __cxa_get_exception_ptr, if the exception is caught by-value rather than by-reference (which we
-//   always do)
+//   it will also (depending on your compiler version! TODO: document) call __cxa_get_exception_ptr, if the exception is
+//   caught by-value rather than by-reference (which we always do)
 //
 // TODO: clearer picture of all the steps here and what order they happen in so reader can follow this code
 
