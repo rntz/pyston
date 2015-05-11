@@ -125,7 +125,8 @@ add_dependencies(lz4 gitsubmodules)
 
 # valgrind
 if(ENABLE_VALGRIND)
-  find_package(Valgrind REQUIRED)
+  # find_package(Valgrind REQUIRED)
+  set(VALGRIND_INCLUDE_DIR /usr/include/valgrind/)
   include_directories(${VALGRIND_INCLUDE_DIR})
   message(STATUS "Including valgrind ${VALGRIND_INCLUDE_DIR}")
 else()
