@@ -48,6 +48,7 @@
 #define DW_EH_PE_aligned        0x50
 
 #define DW_EH_PE_indirect	0x80
+// end dwarf encoding modes
 
 // TODO: given that we're reimplementing a bunch of the C++ ABI, what happens if `new' fails, for example?
 // we're assuming we only ever throw Python/Pyston exceptions, but that might be a bad assumption!
@@ -175,6 +176,10 @@ static inline void parse_lsda_header(const unw_proc_info_t* pip, lsda_info_t* in
     info->call_site_table = ptr;
     // The action table follows immediately after the call site table.
     info->action_table = ptr + call_site_table_nbytes;
+
+    assert(info->landing_pad_base);
+    assert(info->call_site_table);
+    assert(info->action_table);
 }
 
 __attribute__((__always_inline__))
@@ -225,15 +230,21 @@ static inline const uint8_t *first_action(const lsda_info_t* info, const call_si
     return info->action_table + entry->action_offset_plus_one - 1;
 }
 
-static inline int64_t next_action(const uint8_t** pp) {
-    const uint8_t *p = *pp;
-    unsigned leb_size;
-    int64_t type_filter = llvm::decodeSLEB128(p, &leb_size);
-    p += leb_size;
-    int64_t offset_to_next_entry = llvm::decodeSLEB128(p);
+// returns pointer to next action, or NULL if no next action.
+// stores type filter into `*type_filter', stores number of bytes read into `*num_bytes' unless it is null.
+static inline const uint8_t *next_action(const uint8_t* action_ptr, int64_t *type_filter, unsigned *num_bytes = nullptr) {
+    assert(type_filter);
+    unsigned leb_size, total_size;
+    *type_filter = llvm::decodeSLEB128(action_ptr, &leb_size);
+    action_ptr += leb_size;
+    total_size = leb_size;
+    int64_t offset_to_next_entry = llvm::decodeSLEB128(action_ptr, &leb_size);
+    total_size += leb_size;
+    if (num_bytes) {
+        *num_bytes = total_size;
+    }
     // an offset of 0 ends the action-chain.
-    *pp = offset_to_next_entry ? p + offset_to_next_entry : nullptr;
-    return type_filter;
+    return offset_to_next_entry ? action_ptr + offset_to_next_entry : nullptr;
 }
 
 
@@ -245,6 +256,7 @@ static void print_lsda(const lsda_info_t *info) {
     // the call site table ends where the action table begins
     printf("Call site table:\n");
     const uint8_t *p = info->call_site_table;
+    assert(p);
     while (p < info->action_table) {
         call_site_entry_t entry;
         p = parse_call_site_entry(p, info, &entry);
@@ -262,7 +274,8 @@ static void print_lsda(const lsda_info_t *info) {
             if (offset + 1 > action_table_min_len_bytes)
                 action_table_min_len_bytes = offset + 1;
 
-            int64_t type_filter = next_action(&action_ptr);
+            int64_t type_filter;
+            action_ptr = next_action(action_ptr, &type_filter);
             if (action_ptr)
                 printf("    %ld: filter %ld  next %ld\n", offset, type_filter, action_ptr - info->action_table);
             else
@@ -274,10 +287,14 @@ static void print_lsda(const lsda_info_t *info) {
     printf("Action table:\n");
     RELEASE_ASSERT(p == info->action_table, "malformed LSDA");
     while (p < info->action_table + action_table_min_len_bytes) {
+        assert(p);
         ptrdiff_t offset = p - info->action_table;
-        int64_t type_filter = next_action(&p);
+        unsigned num_bytes;
+        int64_t type_filter;
+        const uint8_t *next = next_action(p, &type_filter, &num_bytes);
+        p += num_bytes;
 
-        if (p)
+        if (next)
             printf("  %ld: filter %ld  next %ld\n", offset, type_filter, p - info->action_table);
         else
             printf("  %ld: filter %ld  end\n", offset, type_filter);
@@ -453,7 +470,8 @@ int64_t determine_action(const lsda_info_t* info, const call_site_entry_t *entry
     do {
         ASSERT(p >= info->action_table, "malformed LSDA");
         ptrdiff_t offset = p - info->action_table;
-        int64_t type_filter = next_action(&p);
+        int64_t type_filter;
+        p = next_action(p, &type_filter);
         if (VERBOSITY("cxx_unwind") >= 3) {
             if (p)
                 printf("      %ld: filter %ld  next %ld\n", offset, type_filter, p - info->action_table);
