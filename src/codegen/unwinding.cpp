@@ -59,6 +59,7 @@ namespace pyston {
 
 // Parse an .eh_frame section, and construct a "binary search table" such as you would find in a .eh_frame_hdr section.
 // Currently only supports .eh_frame sections with exactly one fde.
+// See http://www.airs.com/blog/archives/460 for some useful info.
 void parseEhFrame(uint64_t start_addr, uint64_t size, uint64_t func_addr, uint64_t* out_data, uint64_t* out_len) {
     // NB. according to sully, this is not legal C++ - type-punning through unions isn't allowed
     // FIXME: find compiler flags that warn on this shit and use them; then fix this
@@ -79,6 +80,12 @@ void parseEhFrame(uint64_t start_addr, uint64_t size, uint64_t func_addr, uint64
     int fde_length = *u32;
     u32++;
 
+    if (VERBOSITY("unwinding") >= 2 && cie_length + fde_length + 8 != size) { // XXX(rntz)
+        printf("size = %lu\n", size);
+        printf("cie_length: %d\n", cie_length);
+        printf("fde_length: %d\n", fde_length);
+        printf("cie_length + fde_length + 8 = %d\n", cie_length + fde_length + 8);
+    }
     assert(cie_length + fde_length + 8 == size && "more than one fde! (supportable, but not implemented)");
 
     int nentries = 1;
@@ -205,11 +212,12 @@ public:
 #if LLVMREV < 208921
             llvm::DILineInfoTable lines = Context->getLineInfoForAddressRange(
                 func_addr, Size, llvm::DILineInfoSpecifier::FunctionName | llvm::DILineInfoSpecifier::FileLineInfo
-                | llvm::DILineInfoSpecifier::AbsoluteFilePath);
+                                     | llvm::DILineInfoSpecifier::AbsoluteFilePath);
 #else
             llvm::DILineInfoTable lines = Context->getLineInfoForAddressRange(
-                func_addr, Size, llvm::DILineInfoSpecifier(llvm::DILineInfoSpecifier::FileLineInfoKind::AbsoluteFilePath,
-                                                           llvm::DILineInfoSpecifier::FunctionNameKind::LinkageName));
+                func_addr, Size,
+                llvm::DILineInfoSpecifier(llvm::DILineInfoSpecifier::FileLineInfoKind::AbsoluteFilePath,
+                                          llvm::DILineInfoSpecifier::FunctionNameKind::LinkageName));
 #endif
             if (VERBOSITY() >= 3) {
                 for (int i = 0; i < lines.size(); i++) {
@@ -222,7 +230,6 @@ public:
             g.cur_cf->code_start = func_addr;
             g.cur_cf->code_size = Size;
             cf_registry.registerCF(g.cur_cf);
-
         }
 
         assert(func_addr);
