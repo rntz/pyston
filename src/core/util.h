@@ -39,7 +39,7 @@ private:
 public:
     // Timers with non-NULL desc will print times longer than min_usec for debugging when VERBOSITY("time") >= 2
     Timer(const char* desc = NULL, long min_usec = -1);
-    Timer(long min_usec);       // doesn't start the timer
+    Timer(long min_usec); // doesn't start the timer
     ~Timer();
 
     void setExitCallback(std::function<void(long)> _exit_callback) { exit_callback = _exit_callback; }
@@ -55,9 +55,9 @@ public:
     }
 };
 
-#else  // DISABLE_TIMERS
+#else // DISABLE_TIMERS
 class Timer {
-  public:
+public:
     Timer(const char* desc = NULL, long min_usec = -1) {}
     Timer(long min_usec) {}
 
@@ -70,7 +70,7 @@ class Timer {
     long split(const char* newdesc = NULL) { return 0; }
 };
 
-#endif  // #else DISABLE_TIMERS
+#endif // #else DISABLE_TIMERS
 
 bool startswith(const std::string& s, const std::string& pattern);
 bool endswith(const std::string& s, const std::string& pattern);

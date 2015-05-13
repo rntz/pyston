@@ -30,7 +30,8 @@ namespace pyston {
 
 int Timer::level = 0;
 
-Timer::Timer(long min_usec) : min_usec(min_usec), ended(true) {}
+Timer::Timer(long min_usec) : min_usec(min_usec), ended(true) {
+}
 
 Timer::Timer(const char* desc, long min_usec) : min_usec(min_usec), ended(true) {
     restart(desc);
@@ -88,7 +89,7 @@ Timer::~Timer() {
     }
 }
 
-#endif  // !DISABLE_TIMERS
+#endif // !DISABLE_TIMERS
 
 bool startswith(const std::string& s, const std::string& pattern) {
     if (pattern.size() > s.size())
