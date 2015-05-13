@@ -1,17 +1,31 @@
+// Copyright (c) 2014-2015 Dropbox, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include <cstdlib>
-#include <stdint.h>
-#include <stddef.h>
-#include <unwind.h>
 #include <dlfcn.h> // dladdr
+#include <stddef.h>
+#include <stdint.h>
+#include <unwind.h>
 
 #include "llvm/Support/LEB128.h" // for {U,S}LEB128 decoding
 
-#include "core/util.h"               // Timer
+#include "codegen/ast_interpreter.h" // interpreter_instr_addr
+#include "codegen/unwinding.h"       // getCFForAddress
 #include "core/stats.h"              // StatCounter
 #include "core/types.h"              // for ExcInfo
-#include "codegen/ast_interpreter.h" // interpreter_instr_addr
+#include "core/util.h"               // Timer
 #include "runtime/generator.h"       // generatorEntry
-#include "codegen/unwinding.h"       // getCFForAddress
 
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
@@ -27,26 +41,26 @@
 #define CLEANUP_ACTION 0
 
 // Dwarf encoding modes.
-#define DW_EH_PE_absptr         0x00
-#define DW_EH_PE_omit           0xff
+#define DW_EH_PE_absptr 0x00
+#define DW_EH_PE_omit 0xff
 
-#define DW_EH_PE_uleb128        0x01
-#define DW_EH_PE_udata2         0x02
-#define DW_EH_PE_udata4         0x03
-#define DW_EH_PE_udata8         0x04
-#define DW_EH_PE_sleb128        0x09
-#define DW_EH_PE_sdata2         0x0A
-#define DW_EH_PE_sdata4         0x0B
-#define DW_EH_PE_sdata8         0x0C
-#define DW_EH_PE_signed         0x08
+#define DW_EH_PE_uleb128 0x01
+#define DW_EH_PE_udata2 0x02
+#define DW_EH_PE_udata4 0x03
+#define DW_EH_PE_udata8 0x04
+#define DW_EH_PE_sleb128 0x09
+#define DW_EH_PE_sdata2 0x0A
+#define DW_EH_PE_sdata4 0x0B
+#define DW_EH_PE_sdata8 0x0C
+#define DW_EH_PE_signed 0x08
 
-#define DW_EH_PE_pcrel          0x10
-#define DW_EH_PE_textrel        0x20
-#define DW_EH_PE_datarel        0x30
-#define DW_EH_PE_funcrel        0x40
-#define DW_EH_PE_aligned        0x50
+#define DW_EH_PE_pcrel 0x10
+#define DW_EH_PE_textrel 0x20
+#define DW_EH_PE_datarel 0x30
+#define DW_EH_PE_funcrel 0x40
+#define DW_EH_PE_aligned 0x50
 
-#define DW_EH_PE_indirect	0x80
+#define DW_EH_PE_indirect 0x80
 // end dwarf encoding modes
 
 // TODO: given that we're reimplementing a bunch of the C++ ABI, what happens if `new' fails, for example?
@@ -79,7 +93,6 @@ template <typename T> static inline void check(T x) {
 // exception is dereferences of uint64_t*s to read stuff out of an LSDA - we don't use that as of this writing, but we
 // might in future to support DW_EH_PE_udata8.
 
-
 namespace pyston {
 
 struct ExcData;
@@ -93,15 +106,13 @@ struct ExcData {
 
     ExcData() : exc(nullptr, nullptr, nullptr) {}
     ExcData(ExcInfo e) : exc(e) {}
-    ExcData(Box *type, Box *value, Box *traceback) : exc(type, value, traceback) {}
+    ExcData(Box* type, Box* value, Box* traceback) : exc(type, value, traceback) {}
 
     void check() const {
         assert(this);
         assert(canary == CANARY_VALUE);
         assert(exc.type && exc.value && exc.traceback);
-        assert(gc::isValidGCObject(exc.type) &&
-               gc::isValidGCObject(exc.value) &&
-               gc::isValidGCObject(exc.traceback));
+        assert(gc::isValidGCObject(exc.type) && gc::isValidGCObject(exc.value) && gc::isValidGCObject(exc.traceback));
         assert(this == &exception_ferry);
     }
 };
@@ -115,7 +126,7 @@ struct LogTimer {
     StatCounter& counter;
     Timer timer;
 
-    LogTimer(const char *desc, StatCounter& ctr, long min_usec = -1) : counter(ctr), timer(desc, min_usec) {}
+    LogTimer(const char* desc, StatCounter& ctr, long min_usec = -1) : counter(ctr), timer(desc, min_usec) {}
     ~LogTimer() { counter.log(timer.end()); }
 };
 
@@ -123,7 +134,7 @@ static StatCounter us_unwind_loop("us_unwind_loop");
 static StatCounter us_unwind_resume_catch("us_unwind_resume_catch");
 static StatCounter us_unwind_cleanup("us_unwind_cleanup");
 static StatCounter us_unwind_get_proc_info("us_unwind_get_proc_info");
-static StatCounter us_unwind_step("us_unwind_step");                   // TODO
+static StatCounter us_unwind_step("us_unwind_step"); // TODO
 static StatCounter us_unwind_find_call_site_entry("us_unwind_find_call_site_entry");
 
 // do these need to be separate timers? might as well
@@ -145,33 +156,33 @@ static NORETURN void panic(void) {
 // TODO: document this structure & the things it points to
 struct lsda_info_t {
     // base which landing pad offsets are relative to
-    const uint8_t *landing_pad_base;
-    const uint8_t *type_table;
-    const uint8_t *call_site_table;
-    const uint8_t *action_table;
+    const uint8_t* landing_pad_base;
+    const uint8_t* type_table;
+    const uint8_t* call_site_table;
+    const uint8_t* action_table;
     uint8_t type_table_entry_encoding;      // a DW_EH_PE_xxx value
     uint8_t call_site_table_entry_encoding; // a DW_EH_PE_xxx value
 };
 
 struct call_site_entry_t {
-    const uint8_t *instrs_start;
+    const uint8_t* instrs_start;
     size_t instrs_len_bytes;
-    const uint8_t *landing_pad;    // may be NULL if no landing pad
+    const uint8_t* landing_pad; // may be NULL if no landing pad
     // "plus one" so that 0 can mean "no action". offset is in bytes.
     uint64_t action_offset_plus_one;
 };
 
-
+
 // ---------- Parsing stuff ----------
 static inline void parse_lsda_header(const unw_proc_info_t* pip, lsda_info_t* info) {
-    const uint8_t *ptr = (const uint8_t*) pip->lsda;
+    const uint8_t* ptr = (const uint8_t*)pip->lsda;
 
     // 1. Read the landing pad base pointer.
     uint8_t landing_pad_base_encoding = *ptr++;
     if (landing_pad_base_encoding == DW_EH_PE_omit) {
         // The common case is to omit. Then the landing pad base is _Unwind_GetRegion(context), which is the start of
         // the function.
-        info->landing_pad_base = (const uint8_t*) pip->start_ip;
+        info->landing_pad_base = (const uint8_t*)pip->start_ip;
     } else {
         RELEASE_ASSERT(0, "we only support omitting the landing pad base");
     }
@@ -187,7 +198,7 @@ static inline void parse_lsda_header(const unw_proc_info_t* pip, lsda_info_t* in
         info->type_table = nullptr;
         // info->type_table = ptr + offset; // <- The calculation I'm not sure of.
         ptr += uleb_size;
-    } else {                    // type table omitted
+    } else { // type table omitted
         info->type_table = nullptr;
     }
 
@@ -207,23 +218,25 @@ static inline void parse_lsda_header(const unw_proc_info_t* pip, lsda_info_t* in
     assert(info->action_table);
 }
 
-__attribute__((__always_inline__))
-static inline const uint8_t *parse_call_site_entry(const uint8_t *ptr, const lsda_info_t *info,
-                                                   call_site_entry_t *entry) {
+__attribute__((__always_inline__)) static inline const uint8_t
+    * parse_call_site_entry(const uint8_t* ptr, const lsda_info_t* info, call_site_entry_t* entry) {
     uint64_t instrs_start_offset, instrs_len_bytes, landing_pad_offset, action_offset_plus_one;
 
     // TODO: think about how this whole file should work on 32-bit platforms!
     // g++ recently changed from always doing udata4 here to using uleb128
     unsigned uleb_size;
     if (DW_EH_PE_uleb128 == info->call_site_table_entry_encoding) {
-        instrs_start_offset = llvm::decodeULEB128(ptr, &uleb_size);     ptr += uleb_size;
-        instrs_len_bytes = llvm::decodeULEB128(ptr, &uleb_size);        ptr += uleb_size;
-        landing_pad_offset = llvm::decodeULEB128(ptr, &uleb_size);      ptr += uleb_size;
+        instrs_start_offset = llvm::decodeULEB128(ptr, &uleb_size);
+        ptr += uleb_size;
+        instrs_len_bytes = llvm::decodeULEB128(ptr, &uleb_size);
+        ptr += uleb_size;
+        landing_pad_offset = llvm::decodeULEB128(ptr, &uleb_size);
+        ptr += uleb_size;
     } else if (DW_EH_PE_udata4 == info->call_site_table_entry_encoding) {
         // offsets are from landing pad base
-        instrs_start_offset = (uint64_t) *(const uint32_t*) ptr;
-        instrs_len_bytes = (uint64_t) *(const uint32_t*) (ptr + 4);
-        landing_pad_offset = (uint64_t) *(const uint32_t*) (ptr + 8);
+        instrs_start_offset = (uint64_t) * (const uint32_t*)ptr;
+        instrs_len_bytes = (uint64_t) * (const uint32_t*)(ptr + 4);
+        landing_pad_offset = (uint64_t) * (const uint32_t*)(ptr + 8);
         ptr += 12;
     } else {
         RELEASE_ASSERT(0, "expected call site table entries to use DW_EH_PE_udata4 or DW_EH_PE_uleb128");
@@ -249,7 +262,7 @@ static inline const uint8_t *parse_call_site_entry(const uint8_t *ptr, const lsd
     return ptr;
 }
 
-static inline const uint8_t *first_action(const lsda_info_t* info, const call_site_entry_t *entry) {
+static inline const uint8_t* first_action(const lsda_info_t* info, const call_site_entry_t* entry) {
     if (!entry->action_offset_plus_one)
         return nullptr;
     return info->action_table + entry->action_offset_plus_one - 1;
@@ -257,7 +270,8 @@ static inline const uint8_t *first_action(const lsda_info_t* info, const call_si
 
 // returns pointer to next action, or NULL if no next action.
 // stores type filter into `*type_filter', stores number of bytes read into `*num_bytes' unless it is null.
-static inline const uint8_t *next_action(const uint8_t* action_ptr, int64_t *type_filter, unsigned *num_bytes = nullptr) {
+static inline const uint8_t* next_action(const uint8_t* action_ptr, int64_t* type_filter,
+                                         unsigned* num_bytes = nullptr) {
     assert(type_filter);
     unsigned leb_size, total_size;
     *type_filter = llvm::decodeSLEB128(action_ptr, &leb_size);
@@ -272,25 +286,24 @@ static inline const uint8_t *next_action(const uint8_t* action_ptr, int64_t *typ
     return offset_to_next_entry ? action_ptr + offset_to_next_entry : nullptr;
 }
 
-
+
 // ---------- Printing things for debugging purposes ----------
-static void print_lsda(const lsda_info_t *info) {
+static void print_lsda(const lsda_info_t* info) {
     uint64_t action_table_min_len_bytes = 0;
 
     // print call site table
     // the call site table ends where the action table begins
     printf("Call site table:\n");
-    const uint8_t *p = info->call_site_table;
+    const uint8_t* p = info->call_site_table;
     assert(p);
     while (p < info->action_table) {
         call_site_entry_t entry;
         p = parse_call_site_entry(p, info, &entry);
-        printf("  start %p end %p landingpad %p action-plus-one %lx\n",
-               entry.instrs_start, entry.instrs_start + entry.instrs_len_bytes,
-               entry.landing_pad, entry.action_offset_plus_one);
+        printf("  start %p end %p landingpad %p action-plus-one %lx\n", entry.instrs_start,
+               entry.instrs_start + entry.instrs_len_bytes, entry.landing_pad, entry.action_offset_plus_one);
 
         // Follow the action chain.
-        for (const uint8_t *action_ptr = first_action(info, &entry); action_ptr;) {
+        for (const uint8_t* action_ptr = first_action(info, &entry); action_ptr;) {
             RELEASE_ASSERT(action_ptr >= info->action_table, "malformed LSDA");
             ptrdiff_t offset = action_ptr - info->action_table;
             // add one to indicate that there is an entry here. (consider the case of an empty table, for example.)
@@ -316,7 +329,7 @@ static void print_lsda(const lsda_info_t *info) {
         ptrdiff_t offset = p - info->action_table;
         unsigned num_bytes;
         int64_t type_filter;
-        const uint8_t *next = next_action(p, &type_filter, &num_bytes);
+        const uint8_t* next = next_action(p, &type_filter, &num_bytes);
         p += num_bytes;
 
         if (next)
@@ -327,8 +340,7 @@ static void print_lsda(const lsda_info_t *info) {
 }
 
 // FIXME: duplicated from unwinding.cpp
-static
-unw_word_t getFunctionEnd(unw_word_t ip) {
+static unw_word_t getFunctionEnd(unw_word_t ip) {
     unw_proc_info_t pip;
     // where is the documentation for unw_get_proc_info_by_ip, anyway?
     int ret = unw_get_proc_info_by_ip(unw_local_addr_space, ip, &pip, NULL);
@@ -336,8 +348,7 @@ unw_word_t getFunctionEnd(unw_word_t ip) {
     return pip.end_ip;
 }
 
-static
-void print_frame(unw_cursor_t* cursor, const unw_proc_info_t* pip) {
+static void print_frame(unw_cursor_t* cursor, const unw_proc_info_t* pip) {
     // FIXME: code duplication with PythonFrameIter::incr
     static unw_word_t interpreter_instr_end = getFunctionEnd((unw_word_t)interpreter_instr_addr);
     static unw_word_t generator_entry_end = getFunctionEnd((unw_word_t)generatorEntry);
@@ -374,22 +385,22 @@ void print_frame(unw_cursor_t* cursor, const unw_proc_info_t* pip) {
     //     }
     // }
 
-    CompiledFunction *cf = getCFForAddress(ip);
-    AST_stmt *cur_stmt = nullptr;
+    CompiledFunction* cf = getCFForAddress(ip);
+    AST_stmt* cur_stmt = nullptr;
     enum { COMPILED, INTERPRETED, GENERATOR, OTHER } frame_type;
     if (cf) {
         // compiled frame
         frame_type = COMPILED;
         printf("      ip %12lx  bp %lx    JITTED\n", ip, bp);
         // TODO: get current statement
-    } else if ((unw_word_t) interpreter_instr_addr <= ip && ip < interpreter_instr_end) {
+    } else if ((unw_word_t)interpreter_instr_addr <= ip && ip < interpreter_instr_end) {
         // interpreted frame
         frame_type = INTERPRETED;
         printf("      ip %12lx  bp %lx    interpreted\n", ip, bp);
         // sometimes this assert()s!
         // cf = getCFForInterpretedFrame((void*)bp);
         // cur_stmt = getCurrentStatementForInterpretedFrame((void*) bp);
-    } else if ((unw_word_t) generatorEntry <= ip && ip < generator_entry_end) {
+    } else if ((unw_word_t)generatorEntry <= ip && ip < generator_entry_end) {
         // generator return frame
         frame_type = GENERATOR;
         printf("      ip %12lx  bp %lx    generator\n", ip, bp);
@@ -407,20 +418,18 @@ void print_frame(unw_cursor_t* cursor, const unw_proc_info_t* pip) {
     }
 }
 
-
+
 // ---------- Helpers for unwind_loop ----------
-__attribute__((__always_inline__))
-static inline
-bool find_call_site_entry(const lsda_info_t* info, const uint8_t *ip, call_site_entry_t* entry) {
-    const uint8_t *p = info->call_site_table;
+__attribute__((__always_inline__)) static inline bool find_call_site_entry(const lsda_info_t* info, const uint8_t* ip,
+                                                                           call_site_entry_t* entry) {
+    const uint8_t* p = info->call_site_table;
     // The call site table ends where the action table begins.
     while (p < info->action_table) {
         p = parse_call_site_entry(p, info, entry);
 
         if (VERBOSITY("cxx_unwind") >= 3) {
-            printf("    start %p end %p landingpad %p action %lx\n",
-                   entry->instrs_start, entry->instrs_start + entry->instrs_len_bytes,
-                   entry->landing_pad, entry->action_offset_plus_one);
+            printf("    start %p end %p landingpad %p action %lx\n", entry->instrs_start,
+                   entry->instrs_start + entry->instrs_len_bytes, entry->landing_pad, entry->action_offset_plus_one);
         }
 
         // If our IP is in the given range, we found the right entry!
@@ -437,8 +446,8 @@ bool find_call_site_entry(const lsda_info_t* info, const uint8_t *ip, call_site_
     return false;
 }
 
-static inline NORETURN
-void resume(unw_cursor_t* cursor, const uint8_t *landing_pad, int64_t switch_value, const ExcData *exc_data) {
+static inline NORETURN void resume(unw_cursor_t* cursor, const uint8_t* landing_pad, int64_t switch_value,
+                                   const ExcData* exc_data) {
     exc_data->check();
     assert(landing_pad);
     if (VERBOSITY("cxx_unwind") >= 2)
@@ -478,10 +487,9 @@ void resume(unw_cursor_t* cursor, const uint8_t *landing_pad, int64_t switch_val
 //
 // Returns the switch value to be passed into the landing pad, which selects which handler gets run in the case of
 // multiple `catch' blocks, or is 0 to run cleanup code.
-static inline
-int64_t determine_action(const lsda_info_t* info, const call_site_entry_t *entry) {
+static inline int64_t determine_action(const lsda_info_t* info, const call_site_entry_t* entry) {
     // No action means there are destructors/cleanup to run, but no exception handlers.
-    const uint8_t *p = first_action(info, entry);
+    const uint8_t* p = first_action(info, entry);
     if (!p)
         return CLEANUP_ACTION;
 
@@ -528,22 +536,21 @@ int64_t determine_action(const lsda_info_t* info, const call_site_entry_t *entry
     RELEASE_ASSERT(0, "action chain exhausted and no cleanup indicated");
 }
 
-static inline int step(unw_cursor_t *cp) {
+static inline int step(unw_cursor_t* cp) {
     LogTimer t("unw_step", us_unwind_step, 5);
     return unw_step(cp);
 }
 
 // The stack-unwinding loop.
 // TODO: integrate incremental traceback generation into this function
-static inline
-void unwind_loop(const ExcData *exc_data) {
+static inline void unwind_loop(const ExcData* exc_data) {
     Timer t("unwind_loop", 50);
 
     // NB. https://monoinfinito.wordpress.com/series/exception-handling-in-c/ is a very useful resource
     // as are http://www.airs.com/blog/archives/460 and http://www.airs.com/blog/archives/464
     unw_cursor_t cursor;
     {
-        unw_context_t uc;       // exists only to initialize cursor
+        unw_context_t uc; // exists only to initialize cursor
         unw_getcontext(&uc);
         unw_init_local(&cursor, &uc);
     }
@@ -590,8 +597,10 @@ void unwind_loop(const ExcData *exc_data) {
             // 2. Find our current IP in the call site table.
             unw_word_t ip;
             unw_get_reg(&cursor, UNW_REG_IP, &ip);
-            // ip points to the instruction *after* the instruction that caused the error - which is generally (always?) a call
-            // instruction - UNLESS we're in a signal frame, in which case it points at the instruction that caused the error.
+            // ip points to the instruction *after* the instruction that caused the error - which is generally (always?)
+            // a call
+            // instruction - UNLESS we're in a signal frame, in which case it points at the instruction that caused the
+            // error.
             // For now, we assume we're never in a signal frame. So, we decrement it by one.
             //
             // TODO: can this code ever get called on a signal frame?
@@ -625,13 +634,12 @@ void unwind_loop(const ExcData *exc_data) {
     // Hit end of stack! return & let unwindException determine what to do.
 }
 
-
+
 // The unwinder entry-point.
-static
-void unwind(const ExcData *exc) {
+static void unwind(const ExcData* exc) {
     exc->check();
     if (exc->exc.value->hasattr("magic_break")) {
-        (void) (0 == 0);
+        (void)(0 == 0);
     }
     unwind_loop(exc);
     // unwind_loop returned, couldn't find any handler. ruh-roh.
@@ -641,7 +649,7 @@ void unwind(const ExcData *exc) {
 } // extern "C"
 } // namespace pyston
 
-
+
 // Standard library / runtime functions we override
 #if PYSTON_CUSTOM_UNWINDER
 
@@ -652,13 +660,11 @@ void std::terminate() noexcept {
 }
 
 // wrong type signature, but that's okay, it's extern "C"
-extern "C"
-void __gxx_personality_v0() {
+extern "C" void __gxx_personality_v0() {
     RELEASE_ASSERT(0, "__gxx_personality_v0 should never get called");
 }
 
-extern "C"
-void _Unwind_Resume(struct _Unwind_Exception *_exc) {
+extern "C" void _Unwind_Resume(struct _Unwind_Exception* _exc) {
     assert(pyston::in_cleanup_code);
 #ifndef NDEBUG
     pyston::in_cleanup_code = false;
@@ -678,8 +684,7 @@ namespace __cxxabiv1 {
 // TODO?: maybe we should actually use the `exc_obj' pointer passed through all these procedures instead of poisoning it
 // and using cur_thread_state every time?
 
-extern "C"
-void *__cxa_allocate_exception(size_t size) noexcept {
+extern "C" void* __cxa_allocate_exception(size_t size) noexcept {
     // we should only ever be throwing ExcInfos
     ASSERT(size == sizeof(pyston::ExcInfo), "allocating exception whose size doesn't match ExcInfo");
 
@@ -733,21 +738,19 @@ void *__cxa_allocate_exception(size_t size) noexcept {
 //
 // TODO: document that you must always do `catch(ExcInfo e) { ... }' instead so that `e' gets copied locally and isn't
 // volatile.
-extern "C"
-void *__cxa_begin_catch(void *exc_obj_in) noexcept {
+extern "C" void* __cxa_begin_catch(void* exc_obj_in) noexcept {
     assert(exc_obj_in);
     pyston::us_unwind_resume_catch.log(pyston::per_thread_resume_catch_timer.end());
 
     if (VERBOSITY("cxx_unwind"))
         printf("***** __cxa_begin_catch() *****\n");
 
-    const pyston::ExcData *e = (const pyston::ExcData*) exc_obj_in;
+    const pyston::ExcData* e = (const pyston::ExcData*)exc_obj_in;
     e->check();
-    return (void*) &e->exc;
+    return (void*)&e->exc;
 }
 
-extern "C"
-void __cxa_end_catch() {
+extern "C" void __cxa_end_catch() {
     if (VERBOSITY("cxx_unwind"))
         printf("***** __cxa_end_catch() *****\n");
 
@@ -765,26 +768,25 @@ void __cxa_end_catch() {
     //  __cxa_end_catch() followed by _Unwind_Resume(); its sole purpose is to ensure that __cxa_end_catch() is *always*
     //  called on exiting a catch.
     //
-    //  TODO: write a README on how to do exception-handling in the Pyston codebase without fucking up. NB. need to not ever throw exns in dtors.
+    //  TODO: write a README on how to do exception-handling in the Pyston codebase without fucking up. NB. need to not
+    //  ever throw exns in dtors.
 }
 
-extern "C"
-void __cxa_throw(void *exc_obj, std::type_info *tinfo, void (*dtor)(void*)) {
+extern "C" void __cxa_throw(void* exc_obj, std::type_info* tinfo, void (*dtor)(void*)) {
     assert(!pyston::in_cleanup_code);
     assert(exc_obj);
 
     if (VERBOSITY("cxx_unwind"))
         printf("***** __cxa_throw() *****\n");
 
-    pyston::unwind((const pyston::ExcData*) exc_obj);
+    pyston::unwind((const pyston::ExcData*)exc_obj);
 }
 
-extern "C"
-void *__cxa_get_exception_ptr(void *exc_obj_in) noexcept {
+extern "C" void* __cxa_get_exception_ptr(void* exc_obj_in) noexcept {
     assert(exc_obj_in);
-    const pyston::ExcData *e = (const pyston::ExcData*) exc_obj_in;
+    const pyston::ExcData* e = (const pyston::ExcData*)exc_obj_in;
     e->check();
-    return (void*) &e->exc;
+    return (void*)&e->exc;
 }
 
 // We deliberately don't implement rethrowing because we can't implement it correctly with our current strategy for
@@ -796,11 +798,9 @@ void *__cxa_get_exception_ptr(void *exc_obj_in) noexcept {
 //         throw e;
 //     }
 //
-extern "C"
-void __cxa_rethrow() {
+extern "C" void __cxa_rethrow() {
     RELEASE_ASSERT(0, "__cxa_rethrow() unimplemented; please don't use bare `throw' in Pyston!");
 }
-
 }
 
-#endif  // PYSTON_CUSTOM_UNWINDER
+#endif // PYSTON_CUSTOM_UNWINDER
