@@ -164,7 +164,6 @@ public:
         uint64_t the_func_addr;
         bool the_func_addr_set = false;
 
-        llvm_error_code ec;
         for (const auto& sym : Obj.symbols()) {
             llvm::object::SymbolRef::Type SymType;
             if (sym.getType(SymType))
