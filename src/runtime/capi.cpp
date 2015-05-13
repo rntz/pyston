@@ -682,7 +682,7 @@ void checkAndThrowCAPIException() {
 
         RELEASE_ASSERT(value->cls == type, "unsupported");
 
-        if (tb != None)         // FIXME why is this here
+        if (tb != None) // FIXME why is this here
             raiseRaw(ExcInfo(value->cls, value, tb));
         raiseExc(value);
     }
