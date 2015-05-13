@@ -18,11 +18,10 @@
 
 #define PYSTON_CUSTOM_UNWINDER 1 // set to 0 to use C++ unwinder
 
-// %rax is used to store a pointer to the exception in-between various ABI calls. We don't use it, since the exception
-// %is always in a known location, so we put a poison value there instead.
-#define RAX_POISON_VALUE 0xdeadbeef
-
 #define NORETURN __attribute__((__noreturn__))
+
+// canary used in ExcData in debug mode to catch exception-value corruption.
+#define CANARY_VALUE 0xdeadbeef
 
 // An action of 0 in the LSDA action table indicates cleanup.
 #define CLEANUP_ACTION 0
@@ -83,7 +82,33 @@ template <typename T> static inline void check(T x) {
 
 namespace pyston {
 
-thread_local ExcInfo exception_ferry(nullptr, nullptr, nullptr);
+struct ExcData;
+extern thread_local ExcData exception_ferry;
+
+struct ExcData {
+    ExcInfo exc;
+#ifndef NDEBUG
+    unsigned canary = CANARY_VALUE;
+#endif
+
+    ExcData() : exc(nullptr, nullptr, nullptr) {}
+    ExcData(ExcInfo e) : exc(e) {}
+    ExcData(Box *type, Box *value, Box *traceback) : exc(type, value, traceback) {}
+
+    void check() const {
+        assert(this);
+        assert(canary == CANARY_VALUE);
+        assert(exc.type && exc.value && exc.traceback);
+        assert(gc::isValidGCObject(exc.type) &&
+               gc::isValidGCObject(exc.value) &&
+               gc::isValidGCObject(exc.traceback));
+        assert(this == &exception_ferry);
+    }
+};
+
+thread_local ExcData exception_ferry;
+
+static_assert(offsetof(ExcData, exc) == 0, "wrong offset");
 
 // Timer that auto-logs.
 struct LogTimer {
@@ -413,7 +438,8 @@ bool find_call_site_entry(const lsda_info_t* info, const uint8_t *ip, call_site_
 }
 
 static inline NORETURN
-void resume(unw_cursor_t* cursor, const uint8_t *landing_pad, int64_t switch_value, const ExcInfo *exc_info) {
+void resume(unw_cursor_t* cursor, const uint8_t *landing_pad, int64_t switch_value, const ExcData *exc_data) {
+    exc_data->check();
     assert(landing_pad);
     if (VERBOSITY("cxx_unwind") >= 2)
         printf("  * RESUMED: ip %p  switch_value %ld\n", (const void*)landing_pad, (long)switch_value);
@@ -430,13 +456,13 @@ void resume(unw_cursor_t* cursor, const uint8_t *landing_pad, int64_t switch_val
 #endif
     }
 
-    // set rax to pointer to exception ferry
+    // set rax to pointer to exception object
     // set rdx to the switch_value (0 for cleanup, otherwise an index indicating which exception handler to use)
     //
     // TODO: assumes x86-64!
     // maybe I should use __builtin_eh_return_data_regno() here?
     // but then, need to translate into UNW_* values somehow. not clear how.
-    check(unw_set_reg(cursor, UNW_X86_64_RAX, (unw_word_t) &exception_ferry));
+    check(unw_set_reg(cursor, UNW_X86_64_RAX, (unw_word_t)exc_data));
     check(unw_set_reg(cursor, UNW_X86_64_RDX, switch_value));
 
     // resume!
@@ -510,7 +536,7 @@ static inline int step(unw_cursor_t *cp) {
 // The stack-unwinding loop.
 // TODO: integrate incremental traceback generation into this function
 static inline
-void unwind_loop(const ExcInfo *exc_info) {
+void unwind_loop(const ExcData *exc_data) {
     Timer t("unwind_loop", 50);
 
     // NB. https://monoinfinito.wordpress.com/series/exception-handling-in-c/ is a very useful resource
@@ -592,7 +618,7 @@ void unwind_loop(const ExcInfo *exc_info) {
 
         int64_t switch_value = determine_action(&info, &entry);
         us_unwind_loop.log(t.end());
-        resume(&cursor, entry.landing_pad, switch_value, exc_info);
+        resume(&cursor, entry.landing_pad, switch_value, exc_data);
     }
 
     us_unwind_loop.log(t.end());
@@ -602,9 +628,12 @@ void unwind_loop(const ExcInfo *exc_info) {
 
 // The unwinder entry-point.
 static
-void unwind(void) {
-    assert(exception_ferry.type && exception_ferry.value && exception_ferry.traceback);
-    unwind_loop(&exception_ferry);
+void unwind(const ExcData *exc) {
+    exc->check();
+    if (exc->exc.value->hasattr("magic_break")) {
+        (void) (0 == 0);
+    }
+    unwind_loop(exc);
     // unwind_loop returned, couldn't find any handler. ruh-roh.
     panic();
 }
@@ -639,8 +668,8 @@ void _Unwind_Resume(struct _Unwind_Exception *_exc) {
     if (VERBOSITY("cxx_unwind"))
         printf("***** _Unwind_Resume() *****\n");
     // we give `_exc' type `struct _Unwind_Exception*' because unwind.h demands it; it's not actually accurate
-    assert((void*)_exc == (void*)&pyston::exception_ferry); // double-check
-    pyston::unwind();
+    const pyston::ExcData* data = (const pyston::ExcData*)_exc;
+    pyston::unwind(data);
 }
 
 // C++ ABI functionality
@@ -687,7 +716,9 @@ void *__cxa_allocate_exception(size_t size) noexcept {
     // always called when leaving a catch block, even if we're leaving it by re-raising the exception. So if we store
     // our exception info in curexc_*, and then unset these in __cxa_end_catch, then we'll wipe our exception info
     // during unwinding!
-    return (void*) &pyston::exception_ferry;
+    // return (void*) &pyston::exception_ferry;
+
+    return (void*)&pyston::exception_ferry;
 }
 
 // This function is supposed to return a pointer to the exception value actually thrown. So if we threw an ExcInfo, this
@@ -704,16 +735,15 @@ void *__cxa_allocate_exception(size_t size) noexcept {
 // volatile.
 extern "C"
 void *__cxa_begin_catch(void *exc_obj_in) noexcept {
-    assert(exc_obj_in == &pyston::exception_ferry); // double-check
-
+    assert(exc_obj_in);
     pyston::us_unwind_resume_catch.log(pyston::per_thread_resume_catch_timer.end());
 
     if (VERBOSITY("cxx_unwind"))
         printf("***** __cxa_begin_catch() *****\n");
 
-    pyston::ExcInfo *e = &pyston::exception_ferry;
-    assert(e->type && e->value && e->traceback);
-    return (void*) e;
+    const pyston::ExcData *e = (const pyston::ExcData*) exc_obj_in;
+    e->check();
+    return (void*) &e->exc;
 }
 
 extern "C"
@@ -735,30 +765,26 @@ void __cxa_end_catch() {
     //  __cxa_end_catch() followed by _Unwind_Resume(); its sole purpose is to ensure that __cxa_end_catch() is *always*
     //  called on exiting a catch.
     //
-    //  TODO: write a README on how to do exception-handling in the Pyston codebase without fucking up.
+    //  TODO: write a README on how to do exception-handling in the Pyston codebase without fucking up. NB. need to not ever throw exns in dtors.
 }
 
 extern "C"
 void __cxa_throw(void *exc_obj, std::type_info *tinfo, void (*dtor)(void*)) {
     assert(!pyston::in_cleanup_code);
+    assert(exc_obj);
 
     if (VERBOSITY("cxx_unwind"))
         printf("***** __cxa_throw() *****\n");
 
-    ASSERT(exc_obj == (void*) &pyston::exception_ferry,
-           "throwing exception not allocated on the Pyston exception ferry");
-
-    pyston::unwind();
+    pyston::unwind((const pyston::ExcData*) exc_obj);
 }
 
 extern "C"
 void *__cxa_get_exception_ptr(void *exc_obj_in) noexcept {
-    assert(exc_obj_in == &pyston::exception_ferry);
-    assert(pyston::exception_ferry.type
-           && pyston::exception_ferry.value
-           && pyston::exception_ferry.traceback);
-
-    return (void*) &pyston::exception_ferry;
+    assert(exc_obj_in);
+    const pyston::ExcData *e = (const pyston::ExcData*) exc_obj_in;
+    e->check();
+    return (void*) &e->exc;
 }
 
 // We deliberately don't implement rethrowing because we can't implement it correctly with our current strategy for
