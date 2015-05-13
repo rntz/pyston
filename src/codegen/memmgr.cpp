@@ -45,6 +45,9 @@ public:
 
     bool finalizeMemory(std::string* ErrMsg = 0) override;
 
+    void registerEHFrames(uint8_t *Addr, uint64_t LoadAddr, size_t size) override;
+    void deregisterEHFrames(uint8_t *Addr, uint64_t LoadAddr, size_t size) override;
+
 private:
     void invalidateInstructionCache();
 
@@ -230,6 +233,17 @@ PystonMemoryManager::~PystonMemoryManager() {
         sys::Memory::releaseMappedMemory(RWDataMem.AllocatedMem[i]);
     for (unsigned i = 0, e = RODataMem.AllocatedMem.size(); i != e; ++i)
         sys::Memory::releaseMappedMemory(RODataMem.AllocatedMem[i]);
+}
+
+void PystonMemoryManager::registerEHFrames(uint8_t *Addr, uint64_t LoadAddr, size_t size) {
+    // printf("REGISTERING EH FRAME %p %lx %lx\n", Addr, LoadAddr, size);
+    assert((uint64_t)Addr == LoadAddr); // XXX(rntz)
+    RTDyldMemoryManager::registerEHFrames(Addr, LoadAddr, size);
+}
+
+void PystonMemoryManager::deregisterEHFrames(uint8_t *Addr, uint64_t LoadAddr, size_t size) {
+    // printf("DEREGISTERING EH FRAME %p %lu %zu\n", Addr, LoadAddr, size);
+    RTDyldMemoryManager::deregisterEHFrames(Addr, LoadAddr, size);
 }
 
 std::unique_ptr<llvm::RTDyldMemoryManager> createMemoryManager() {

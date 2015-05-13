@@ -27,6 +27,9 @@ class BoxedModule;
 class BoxedTraceback;
 struct FrameInfo;
 
+// FIXME: better name
+void registerDynamicEHFrame(void *code, size_t code_size, void *eh_frame, size_t eh_frame_size);
+
 BoxedModule* getCurrentModule();
 Box* getGlobals();     // returns either the module or a globals dict
 Box* getGlobalsDict(); // always returns a dict-like object
