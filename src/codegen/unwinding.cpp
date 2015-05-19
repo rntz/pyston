@@ -61,8 +61,8 @@ namespace pyston {
 // Currently only supports .eh_frame sections with exactly one fde.
 // See http://www.airs.com/blog/archives/460 for some useful info.
 void parseEhFrame(uint64_t start_addr, uint64_t size, uint64_t func_addr, uint64_t* out_data, uint64_t* out_len) {
-    // NB. according to sully, this is not legal C++ - type-punning through unions isn't allowed
-    // FIXME: find compiler flags that warn on this shit and use them; then fix this
+    // NB. according to sully@msully.net, this is not legal C++ b/c type-punning through unions isn't allowed.
+    // But I can't find a compiler flag that warns on it, and it seems to work.
     union {
         uint8_t* u8;
         uint32_t* u32;

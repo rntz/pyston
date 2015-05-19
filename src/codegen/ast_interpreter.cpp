@@ -295,8 +295,6 @@ public:
 Value ASTInterpreter::execute(ASTInterpreter& interpreter, CFGBlock* start_block, AST_stmt* start_at) {
     threading::allowGLReadPreemption();
 
-    // NB. we rely on __builtin_frame_address getting our /base pointer/. See e.g. PythonFrameIterator::incr() in
-    // codegen/unwinding.cpp.
     void* frame_addr = __builtin_frame_address(0);
     RegisterHelper frame_registerer(&interpreter, frame_addr);
 
