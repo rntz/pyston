@@ -134,7 +134,7 @@ static StatCounter us_unwind_loop("us_unwind_loop");
 static StatCounter us_unwind_resume_catch("us_unwind_resume_catch");
 static StatCounter us_unwind_cleanup("us_unwind_cleanup");
 static StatCounter us_unwind_get_proc_info("us_unwind_get_proc_info");
-static StatCounter us_unwind_step("us_unwind_step"); // TODO
+static StatCounter us_unwind_step("us_unwind_step");
 static StatCounter us_unwind_find_call_site_entry("us_unwind_find_call_site_entry");
 
 // do these need to be separate timers? might as well
@@ -360,30 +360,30 @@ static void print_frame(unw_cursor_t* cursor, const unw_proc_info_t* pip) {
     // NB. unw_get_proc_name appears to be MUCH slower than dl_addr for getting the names of functions!
     // but it also gets the names of more functions, so we use it for now.
 
-    {
-        char name[500];
-        unw_word_t off;
-        int err = unw_get_proc_name(cursor, name, 500, &off);
-        // ENOMEM means name didn't fit in buffer, so it was truncated. We're okay with that.
-        RELEASE_ASSERT(!err || err == -UNW_ENOMEM || err == -UNW_ENOINFO, "unw_get_proc_name errored");
-        if (err != -UNW_ENOINFO) {
-            printf(strnlen(name, 500) < 50 ? "  %-50s" : "  %s\n", name);
-        } else {
-            printf("  %-50s", "? (no info)");
-        }
-    }
-
     // {
-    //     Dl_info dl_info;
-    //     if (dladdr((void*)ip, &dl_info)) { // returns non-zero on success, wtf?
-    //         if (!dl_info.dli_sname || strlen(dl_info.dli_sname) < 50)
-    //             printf("  %-50s", dl_info.dli_sname ? dl_info.dli_sname : "(unnamed)");
-    //         else
-    //             printf("  %s\n", dl_info.dli_sname);
+    //     char name[500];
+    //     unw_word_t off;
+    //     int err = unw_get_proc_name(cursor, name, 500, &off);
+    //     // ENOMEM means name didn't fit in buffer, so it was truncated. We're okay with that.
+    //     RELEASE_ASSERT(!err || err == -UNW_ENOMEM || err == -UNW_ENOINFO, "unw_get_proc_name errored");
+    //     if (err != -UNW_ENOINFO) {
+    //         printf(strnlen(name, 500) < 50 ? "  %-50s" : "  %s\n", name);
     //     } else {
-    //         printf("  %-50s", "? (no dl info)");
+    //         printf("  %-50s", "? (no info)");
     //     }
     // }
+
+    {
+        Dl_info dl_info;
+        if (dladdr((void*)ip, &dl_info)) { // returns non-zero on success, wtf?
+            if (!dl_info.dli_sname || strlen(dl_info.dli_sname) < 50)
+                printf("  %-50s", dl_info.dli_sname ? dl_info.dli_sname : "(unnamed)");
+            else
+                printf("  %s\n", dl_info.dli_sname);
+        } else {
+            printf("  %-50s", "? (no dl info)");
+        }
+    }
 
     CompiledFunction* cf = getCFForAddress(ip);
     AST_stmt* cur_stmt = nullptr;
@@ -549,11 +549,14 @@ static inline void unwind_loop(const ExcData* exc_data) {
     // NB. https://monoinfinito.wordpress.com/series/exception-handling-in-c/ is a very useful resource
     // as are http://www.airs.com/blog/archives/460 and http://www.airs.com/blog/archives/464
     unw_cursor_t cursor;
-    {
-        unw_context_t uc; // exists only to initialize cursor
-        unw_getcontext(&uc);
-        unw_init_local(&cursor, &uc);
-    }
+    unw_context_t uc; // exists only to initialize cursor
+#ifndef NDEBUG
+    // poison stack memory. have had problems with these structures being insufficiently initialized.
+    memset(&uc, 0xef, sizeof uc);
+    memset(&cursor, 0xef, sizeof cursor);
+#endif
+    unw_getcontext(&uc);
+    unw_init_local(&cursor, &uc);
 
     // TODO?: need to handle unwinding through generator frames?
     while (step(&cursor) > 0) {
