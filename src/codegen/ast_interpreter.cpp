@@ -77,10 +77,10 @@ public:
     void initArguments(int nargs, BoxedClosure* closure, BoxedGenerator* generator, Box* arg1, Box* arg2, Box* arg3,
                        Box** args);
 
-    // FIXME XXX(rntz): must be marked no-inline.
-    //
-    // this must be no-inline because we rely on being able to detect when we're inside of it during a stack-trace in
-    // order to produce tracebacks inside interpreted code.
+    // This must not be inlined, because we rely on being able to detect when we're inside of it (by checking whether
+    // %rip is inside its instruction range) during a stack-trace in order to produce tracebacks inside interpreted
+    // code.
+    __attribute__((__no_inline__))
     static Value execute(ASTInterpreter& interpreter, CFGBlock* start_block = NULL, AST_stmt* start_at = NULL);
 
 private:
