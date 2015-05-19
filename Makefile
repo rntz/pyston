@@ -887,7 +887,6 @@ CMAKE_DIR_DBG := $(HOME)/pyston-build-dbg
 CMAKE_DIR_VALGRIND := $(HOME)/pyston-build-valgrind
 CMAKE_DIR_RELEASE := $(HOME)/pyston-build-release
 CMAKE_SETUP_DBG := $(CMAKE_DIR_DBG)/build.ninja
-CMAKE_SETUP_VALGRIND := $(CMAKE_DIR_VALGRIND)/build.ninja
 CMAKE_SETUP_RELEASE := $(CMAKE_DIR_RELEASE)/build.ninja
 .PHONY: cmake_check clang_check
 $(CMAKE_SETUP_DBG):
@@ -895,11 +894,6 @@ $(CMAKE_SETUP_DBG):
 	@$(MAKE) clang_check
 	@mkdir -p $(CMAKE_DIR_DBG)
 	cd $(CMAKE_DIR_DBG); CC='clang' CXX='clang++' cmake -GNinja $(HOME)/pyston -DCMAKE_BUILD_TYPE=Debug
-$(CMAKE_SETUP_VALGRIND):
-	@$(MAKE) cmake_check
-	@$(MAKE) clang_check
-	@mkdir -p $(CMAKE_DIR_VALGRIND)
-	cd $(CMAKE_DIR_VALGRIND); CC='clang' CXX='clang++' cmake -GNinja $(HOME)/pyston -DCMAKE_BUILD_TYPE=Debug -DENABLE_VALGRIND=ON
 $(CMAKE_SETUP_RELEASE):
 	@$(MAKE) cmake_check
 	@$(MAKE) clang_check
@@ -910,9 +904,6 @@ $(CMAKE_SETUP_RELEASE):
 pyston_dbg: $(CMAKE_SETUP_DBG)
 	$(NINJA) -C $(CMAKE_DIR_DBG) pyston copy_stdlib copy_libpyston ext_pyston $(NINJAFLAGS)
 	ln -sf $(CMAKE_DIR_DBG)/pyston pyston_dbg
-pyston_valgrind: $(CMAKE_SETUP_VALGRIND)
-	$(NINJA) -C $(CMAKE_DIR_VALGRIND) pyston copy_stdlib copy_libpyston ext_pyston $(NINJAFLAGS)
-	ln -sf $(CMAKE_DIR_VALGRIND)/pyston pyston_valgrind
 pyston_release: $(CMAKE_SETUP_RELEASE)
 	$(NINJA) -C $(CMAKE_DIR_RELEASE) pyston copy_stdlib copy_libpyston ext_pyston $(NINJAFLAGS)
 	ln -sf $(CMAKE_DIR_RELEASE)/pyston pyston_release
