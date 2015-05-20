@@ -271,10 +271,8 @@ void ASTInterpreter::initArguments(int nargs, BoxedClosure* _closure, BoxedGener
 }
 
 // Map from stack frame pointers for frames corresponding to ASTInterpreter::execute() to the ASTInterpreter handling
-// them. Used to look up information about that frame. This is used for getting tracebacks. I think it's also used for
-// CPython introspection (sys._getframe & co).
-//
-// TODO: get kmod to check this is an accurate description
+// them. Used to look up information about that frame. This is used for getting tracebacks, for CPython introspection
+// (sys._getframe & co), and for GC scanning.
 static std::unordered_map<void*, ASTInterpreter*> s_interpreterMap;
 static_assert(THREADING_USE_GIL, "have to make the interpreter map thread safe!");
 
