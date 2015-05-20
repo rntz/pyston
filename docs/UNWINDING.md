@@ -63,13 +63,13 @@ If we're in phase 2, the personality function then jumps to the landing pad, aft
 
 It dispatches to code in one of two flavors: *cleanup code* (`finally` blocks and RAII destructors), or *handler code* (`catch` blocks).
 
-### Cleanup code (`finally`/RAII)
+#### Cleanup code (`finally`/RAII)
 
 Cleanup code does what you'd expect: calls the appropriate destructors and/or runs the code in the appropriate `finally` block. It may also call `__cxa_end_catch()`, if we are unwinding out of a catch block - think of `__cxa_begin_catch()` and `__cxa_end_catch()` as like RAII constructor/destructor pairs; the latter is guaranteed to get called when leaving a catch block, whether normally or by exception.
 
-After this is done, it calls `_Unwind_Resume()`, passing it the exception object pointer that it received in `RAX` when the personality function jumped to the landing pad.
+After this is done, it calls `_Unwind_Resume()` to resume unwinding, passing it the exception object pointer that it received in `RAX` when the personality function jumped to the landing pad.
 
-### Handler code (`catch`)
+#### Handler code (`catch`)
 
 Handler code, first of all, may *also* call RAII destructors or other cleanup code if necessary. After that, it *may* call `__cxa_get_exception_ptr` with the exception object pointer. I'm not sure why it does this, but it expects `__cxa_get_exception_ptr` to also *return* a pointer to the exception object, so it's effectively a no-op. (I think in a normal C++ unwinder maybe there's an exception *header* as well, and some pointer arithmetic going on, so that the pointer passed in `RAX` to the landing pad and the exception object itself are different?)
 
@@ -79,7 +79,7 @@ Then, *if* the exception is caught by-value (`catch (ExcInfo e)`) rather than by
 
 Then it runs the code inside the catch block, like you'd expect.
 
-Finally, it calls `__cxa_end_catch()` (with *no arguments*).
+Finally, it calls `__cxa_end_catch()` (which takes no arguments). In regular C++ this destroys the current exception if appropriate. (It grabs the exception out of some thread-specific data structure that I don't fully understand.)
 
 # How our unwinder is different
 
