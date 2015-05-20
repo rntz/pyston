@@ -10,9 +10,9 @@ The custom unwinder is in `src/runtime/cxx_unwind.cpp`.
 
 ### Useful references on C++ exception handling
 
-[https://monoinfinito.wordpress.com/series/exception-handling-in-c/](): Good overview of C++ exceptions.
-[http://www.airs.com/blog/archives/460](): Covers dirty details of `.eh_frame`.
-[http://www.airs.com/blog/archives/464](): Covers dirty details of the personality function and the LSDA.
+- [https://monoinfinito.wordpress.com/series/exception-handling-in-c/](): Good overview of C++ exceptions.
+- [http://www.airs.com/blog/archives/460](): Covers dirty details of `.eh_frame`.
+- [http://www.airs.com/blog/archives/464](): Covers dirty details of the personality function and the LSDA.
 
 # How normal C++ unwinding works
 
@@ -59,7 +59,7 @@ If the personality function finds a "special" action to perform when unwinding, 
 - The *landing pad*, a code address, determined by the instruction pointer value.
 - The *switch value*, an `int64_t`. This is *zero* if we're running cleanup code (RAII destructors or a `finally` block); otherwise it is an index that indicates *which* `catch` block we've matched (since there may be several `catch` blocks covering the code region we're unwinding through).
 
-If we're in phase 2, the personality function then jumps to the landing pad, after (a) restoring execution state for this call frame and (b) storing the exception object pointer and the switch value in specific registers (RAX and RDX respectively). The code at the landing pad is emitted by the C++ compiler as part of the function being unwound through, and it dispatches on the switch value to determine what code to actually run.
+If we're in phase 2, the personality function then jumps to the landing pad, after (a) restoring execution state for this call frame and (b) storing the exception object pointer and the switch value in specific registers (`RAX` and `RDX` respectively). The code at the landing pad is emitted by the C++ compiler as part of the function being unwound through, and it dispatches on the switch value to determine what code to actually run.
 
 It dispatches to code in one of two flavors: *cleanup code* (`finally` blocks and RAII destructors), or *handler code* (`catch` blocks).
 
@@ -109,3 +109,33 @@ Third, when unwinding, we only check whether a function *has* a personality func
 - `__cxxabiv1::__cxa_get_exception_ptr`
 
 # Future work
+
+## Incremental traceback generation
+
+Python tracebacks include only the area of the stack between where the exception was originally raised and where it gets caught. Currently we generate tracebacks (via `getTraceback`) using `unwindPythonStack()` in `src/codegen/unwinding.cpp`, which unwinds the whole stack at once.
+
+Instead we ought to generate them *as we unwind*. This should be a straightforward matter of taking the code in `unwindPythonStack` and integrating it into `unwind_loop` (in `src/runtime/cxx_unwind.cpp`), so that we keep a "current traceback" object that we update as we unwind the stack and discover Python frames.
+
+## Binary search in libunwind
+
+Libunwind, like libgcc, keeps a linked list of objects (executables, shared libraries) to search for debug info. Since it's a linked list, if it's very long we can't find debug info efficiently; a better way would be to keep an array sorted by the start address of the object (since objects are non-overlapping). This comes up in practice because LLVM JITs each function as a separate object.
+
+libunwind's linked list is updated in `_U_dyn_register` (in `libunwind/src/mi/dyn-register.c`) and scanned in `local_find_proc_info` (in `libunwind/src/mi/Gfind_dynamic_proc_info.c`) (and possibly elsewhere).
+
+## GC awareness
+
+Currently we store exceptions-being-unwound in a thread-local variable, `pyston::exception_ferry` (in `src/runtime/cxx_unwind.cpp`). This is invisible to the GC. This *should* be fine, since this variable is only relevant during unwinding, and unwinding *should not* trigger the GC. `catch`-block code might, but as long as we catch by-value (`catch (ExcInfo e)` rather than `catch (ExcInfo& e)`), the relevant pointers will be copied to our stack (thus GC-visible) before any catch-block code is run. The only other problem is if *destructors* can cause GC, since destructors *are* called during unwinding and there's nothing we can do about that. So don't do that!
+
+It wouldn't be too hard to make the GC aware of `pyston::exception_ferry`. We could either:
+- add code to the GC that regards `pyston::exception_ferry` as a source of roots, OR
+- store the exception ferry in `cur_thread_state` instead of its own variable, and update `ThreadStateInternal::accept`
+
+HOWEVER, there's a problem: if we do this, we need to *zero out* the exception ferry at the appropriate time (to avoid keeping an exception alive after it ought to be garbage), and this is harder than it seems. We can't zero it out in `__cxa_begin_catch`, because it's only *after* `__cxa_begin_catch` returns that the exception is copied to the stack. We can't zero it in `__cxa_end_catch`, because `__cxa_end_catch` is called *even if exiting a catch block due to an exception*, so we'd wipe an exception that we actually wanted to propagate!
+
+So this is tricky.
+
+## Decrementing IC counts when unwinding through ICs
+
+To do this, we need some way to tell when we're unwinding through an IC. Keeping a global map from instruction-ranges to IC information should suffice. Then we just check and update this map inside of `unwind_loop`. This might slow us down a bit, but it's probably negligible; worth measuring, though.
+
+Alternatively, there might be some way to use the existing cleanup-code support in the unwinder to do this. That would involve generating EH-frames on the fly, but we already do this! So probably we'd just need to generate more complicated EH frames.
