@@ -59,7 +59,27 @@ If the personality function finds a "special" action to perform when unwinding, 
 - The *landing pad*, a code address, determined by the instruction pointer value.
 - The *switch value*, an `int64_t`. This is *zero* if we're running cleanup code (RAII destructors or a `finally` block); otherwise it is an index that indicates *which* `catch` block we've matched (since there may be several `catch` blocks covering the code region we're unwinding through).
 
-If we're in phase 2, the personality function then *jumps* to the landing pad, after (a) restoring execution state for this call frame and (b) storing the exception object pointer and the switch value in specific registers (RAX and RDX respectively). The code at the landing pad is emitted by the C++ compiler, and it dispatches on the switch value to determine what code to actually run.
+If we're in phase 2, the personality function then jumps to the landing pad, after (a) restoring execution state for this call frame and (b) storing the exception object pointer and the switch value in specific registers (RAX and RDX respectively). The code at the landing pad is emitted by the C++ compiler as part of the function being unwound through, and it dispatches on the switch value to determine what code to actually run.
+
+It dispatches to code in one of two flavors: *cleanup code* (`finally` blocks and RAII destructors), or *handler code* (`catch` blocks).
+
+### Cleanup code (`finally`/RAII)
+
+Cleanup code does what you'd expect: calls the appropriate destructors and/or runs the code in the appropriate `finally` block. It may also call `__cxa_end_catch()`, if we are unwinding out of a catch block - think of `__cxa_begin_catch()` and `__cxa_end_catch()` as like RAII constructor/destructor pairs; the latter is guaranteed to get called when leaving a catch block, whether normally or by exception.
+
+After this is done, it calls `_Unwind_Resume()`, passing it the exception object pointer that it received in `RAX` when the personality function jumped to the landing pad.
+
+### Handler code (`catch`)
+
+Handler code, first of all, may *also* call RAII destructors or other cleanup code if necessary. After that, it *may* call `__cxa_get_exception_ptr` with the exception object pointer. I'm not sure why it does this, but it expects `__cxa_get_exception_ptr` to also *return* a pointer to the exception object, so it's effectively a no-op. (I think in a normal C++ unwinder maybe there's an exception *header* as well, and some pointer arithmetic going on, so that the pointer passed in `RAX` to the landing pad and the exception object itself are different?)
+
+After this, it calls `__cxa_begin_catch()` with the exception object pointer. Again, `__cxa_begin_catch()` is expected to return the exception object pointer, so in Pyston this is basically a no-op. (Again, maybe there's some funky pointer arithmetic going on in regular C++ unwinding - I'm not sure.)
+
+Then, *if* the exception is caught by-value (`catch (ExcInfo e)`) rather than by-reference (`catch (ExcInfo& e)`) - and Pyston must *always* catch by value - it copies the exception object onto the stack.
+
+Then it runs the code inside the catch block, like you'd expect.
+
+Finally, it calls `__cxa_end_catch()` (with *no arguments*).
 
 # How our unwinder is different
 
