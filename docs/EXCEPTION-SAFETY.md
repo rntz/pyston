@@ -6,11 +6,11 @@ In addition to following general best practices for writing exception-safe C++, 
 
 2. **Always catch by value.** That is, always write:
 
-       try { ... } catch (ExcInfo e) { ... } // Do this!
+   > try { ... } catch (ExcInfo e) { ... } // Do this!
 
    And **never** write:
 
-       try { ... } catch (ExcInfo& e) { ... } // DO NOT DO THIS!
+   > try { ... } catch (ExcInfo& e) { ... } // DO NOT DO THIS!
 
    The reason for this has to do with the way exceptions are stored in thread-local storage in Pyston; see `docs/UNWINDING.md` for the gory details.
 
