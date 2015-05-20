@@ -8,6 +8,12 @@ Pyston uses a custom exception unwinder, replacing the general-purpose C++ unwin
 
 The custom unwinder is in `src/runtime/cxx_unwind.cpp`.
 
+### Useful references on C++ exception handling
+
+[https://monoinfinito.wordpress.com/series/exception-handling-in-c/](): Good overview of C++ exceptions.
+[http://www.airs.com/blog/archives/460](): Covers dirty details of `.eh_frame`.
+[http://www.airs.com/blog/archives/464](): Covers dirty details of the personality function and the LSDA.
+
 # How normal C++ unwinding works
 
 The big picture is that when an exception is thrown, we walk the stack *twice*:
@@ -19,8 +25,6 @@ The big picture is that when an exception is thrown, we walk the stack *twice*:
 The purpose of the two-phase search is to make sure that *exceptions that won't be caught terminate the process immediately with a full stack-trace*. In Pyston we don't care about this --- stack traces work differently for us anyway.
 
 ## How normal C++ unwinding works, in detail
-
-[This excellent blog post](https://monoinfinito.wordpress.com/series/exception-handling-in-c/) covers the dirty details. What follows is a summary:
 
 ### Throwing
 
@@ -46,13 +50,16 @@ The job of the personality function is to:
 
 3. If we are in Phase 2, actually take the relevant action: jump into the relevant cleanup code, `finally`, or `catch` block. In this case, the personality function does not return.
 
-### The LSDA: how the personality function works
+### The LSDA, landing pads and switch values: how the personality function works
 
 The personality function determines what to do by comparing the instruction pointer being unwound through against C++-specific unwinding information. This is contained in an area of `.eh_frame` called the LSDA (Language-Specific Data Area). See [this blog post](http://www.airs.com/blog/archives/464) for a detailed run-down.
 
-### Landing pads and resuming from the personality function
+If the personality function finds a "special" action to perform when unwinding, it is associated with two values:
 
-TODO
+- The *landing pad*, a code address, determined by the instruction pointer value.
+- The *switch value*, an `int64_t`. This is *zero* if we're running cleanup code (RAII destructors or a `finally` block); otherwise it is an index that indicates *which* `catch` block we've matched (since there may be several `catch` blocks covering the code region we're unwinding through).
+
+If we're in phase 2, the personality function then *jumps* to the landing pad, after (a) restoring execution state for this call frame and (b) storing the exception object pointer and the switch value in specific registers (RAX and RDX respectively). The code at the landing pad is emitted by the C++ compiler, and it dispatches on the switch value to determine what code to actually run.
 
 # How our unwinder is different
 
@@ -80,3 +87,5 @@ Third, when unwinding, we only check whether a function *has* a personality func
 - `__cxxabiv1::__cxa_throw`
 - `__cxxabiv1::__cxa_rethrow`: stubbed out, we never rethrow directly
 - `__cxxabiv1::__cxa_get_exception_ptr`
+
+# Future work
