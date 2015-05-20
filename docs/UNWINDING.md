@@ -2,25 +2,25 @@
 
 Pyston uses a custom exception unwinder, replacing the general-purpose C++ unwinder provided by `libstdc++` and `libgcc`. We do this for two reasons:
 
-1. Efficiency. The default clang/gcc C++ unwinder is slow, because it needs to support features we don't (such as two-phase unwinding, and having multiple exception types) and because it isn't optimized for speed (C++ assumes exceptions are uncommon).
+1. **Efficiency**. The default clang/gcc C++ unwinder is slow, because it needs to support features we don't (such as two-phase unwinding, and having multiple exception types) and because it isn't optimized for speed (C++ assumes exceptions are uncommon).
 
-2. Customizability. For example, Python handles backtraces differently than C++ does; with a custom unwinder, we can support Python-style backtraces more easily.
+2. **Customizability**. For example, Python handles backtraces differently than C++ does; with a custom unwinder, we can support Python-style backtraces more easily.
 
 The custom unwinder is in `src/runtime/cxx_unwind.cpp`.
 
 # How normal C++ unwinding works
 
-The "big picture" is that when an exception is thrown, we walk the stack *twice*:
+The big picture is that when an exception is thrown, we walk the stack *twice*:
 
 1. In the first phase, we look for a `catch`-block whose type matches the thrown exception. If we don't find one, we terminate the process.
 
 2. In the second phase, we unwind up to the `catch`-block we found; along the way we run any intervening `finally` blocks or RAII destructors.
 
-The purpose of the two-phase search is to make sure that *exceptions that won't be caught terminate the process immediately with a full stack-trace*. In Pyston we don't care about this - stack traces work differently for us anyway.
+The purpose of the two-phase search is to make sure that *exceptions that won't be caught terminate the process immediately with a full stack-trace*. In Pyston we don't care about this --- stack traces work differently for us anyway.
 
-## How C++ unwinding works, in detail
+## How normal C++ unwinding works, in detail
 
-If you want the dirty details, [this](https://monoinfinito.wordpress.com/series/exception-handling-in-c/) is an excellent blog post. What follows is a summary:
+[This excellent blog post](https://monoinfinito.wordpress.com/series/exception-handling-in-c/) covers the dirty details. What follows is a summary:
 
 ### Throwing
 
@@ -36,7 +36,7 @@ These methods (and others in the `__cxxabiv1` namespace) are defined in `libstdc
 
 The libgcc unwinder walks the call frame stack, looking up debug information about each function it unwinds through. It finds the debug information by searching for the instruction pointer that would be returned-to in a list of tables; one table for each loaded object (in the linker-and-loader sense of "object", i.e. executable file or shared library). For a given object, the debug info is in a section called `.eh_frame`. See [this blog post](http://www.airs.com/blog/archives/460) for more on the format of `.eh_frame`.
 
-In particular, the unwinder checks whether the function has an associated "personality function", and calls it if it does. If there's no personality function, or if the personality function returns normally, unwinding continues as normal. C functions do not have personality functions. C++ functions have the personality function `__gxx_personality_v0`, or (if they don't involve exceptions or RAII at all) no personality function.
+In particular, the unwinder checks whether the function has an associated "personality function", and calls it if it does. If there's no personality function, unwinding continues as normal. C functions do not have personality functions. C++ functions have the personality function `__gxx_personality_v0`, or (if they don't involve exceptions or RAII at all) no personality function.
 
 The job of the personality function is to:
 
