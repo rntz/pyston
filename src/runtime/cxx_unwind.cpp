@@ -63,35 +63,12 @@
 #define DW_EH_PE_indirect 0x80
 // end dwarf encoding modes
 
-// TODO: given that we're reimplementing a bunch of the C++ ABI, what happens if `new' fails, for example?
-// we're assuming we only ever throw Python/Pyston exceptions, but that might be a bad assumption!
-
-// The parts of the C++ unwinding things that I can't fuck with, because they get hard-coded into the emitted program:
-//
-// - on resuming an exception handler or cleanup code via a landing pad:
-//       %rax contains the exception pointer
-//       %rdx contains the switch value indicating which handler was invoked (or 0, for cleanup)
-//
-//   %rax is treated opaquely, and is only passed to __cxa_begin_catch, _Unwind_Resume & co
-//
-// - the landingpad code will call __cxa_begin_catch, __cxa_end_catch, and _Unwind_Resume
-//   as appropriate. (How do I know they won't get inlined? That would be bad.)
-//
-//   it will also (depending on your compiler version! TODO: document) call __cxa_get_exception_ptr, if the exception is
-//   caught by-value rather than by-reference (which we always do)
-//
-// TODO: clearer picture of all the steps here and what order they happen in so reader can follow this code
-
 extern "C" void __gxx_personality_v0(); // wrong type signature, but that's ok, it's extern "C"
 
 // check(EXPR) is like assert((EXPR) == 0), but evaluates EXPR even in debug mode.
 template <typename T> static inline void check(T x) {
     assert(x == 0);
 }
-
-// TODO: This file uses uint64_t liberally. These should probably be changed to uintptr_t, for 32-bit compatibility. The
-// exception is dereferences of uint64_t*s to read stuff out of an LSDA - we don't use that as of this writing, but we
-// might in future to support DW_EH_PE_udata8.
 
 namespace pyston {
 
@@ -152,8 +129,6 @@ static NORETURN void panic(void) {
 
 // Highly useful resource: http://www.airs.com/blog/archives/464
 // talks about DWARF LSDA parsing with respect to C++ exception-handling
-//
-// TODO: document this structure & the things it points to
 struct lsda_info_t {
     // base which landing pad offsets are relative to
     const uint8_t* landing_pad_base;
@@ -169,7 +144,7 @@ struct call_site_entry_t {
     size_t instrs_len_bytes;
     const uint8_t* landing_pad; // may be NULL if no landing pad
     // "plus one" so that 0 can mean "no action". offset is in bytes.
-    uint64_t action_offset_plus_one;
+    size_t action_offset_plus_one;
 };
 
 
@@ -190,7 +165,7 @@ static inline void parse_lsda_header(const unw_proc_info_t* pip, lsda_info_t* in
     // 2. Read the type table encoding & base pointer.
     info->type_table_entry_encoding = *ptr++;
     if (info->type_table_entry_encoding != DW_EH_PE_omit) {
-        // read ULEB128-formatted byte offset from THIS FIELD (?) to the start of the types table.
+        // read ULEB128-formatted byte offset from THIS FIELD to the start of the types table.
         unsigned uleb_size;
         uint64_t offset = llvm::decodeULEB128(ptr, &uleb_size);
         // We don't use the type table, and I'm not sure this calculation is correct - it might be an offset from a
@@ -205,7 +180,7 @@ static inline void parse_lsda_header(const unw_proc_info_t* pip, lsda_info_t* in
     // 3. Read the call-site encoding & base pointer.
     info->call_site_table_entry_encoding = *ptr++;
     unsigned uleb_size;
-    uint64_t call_site_table_nbytes = llvm::decodeULEB128(ptr, &uleb_size);
+    size_t call_site_table_nbytes = llvm::decodeULEB128(ptr, &uleb_size);
     ptr += uleb_size;
 
     // The call site table follows immediately after the header.
@@ -218,12 +193,11 @@ static inline void parse_lsda_header(const unw_proc_info_t* pip, lsda_info_t* in
     assert(info->action_table);
 }
 
-__attribute__((__always_inline__)) static inline const uint8_t
-    * parse_call_site_entry(const uint8_t* ptr, const lsda_info_t* info, call_site_entry_t* entry) {
-    uint64_t instrs_start_offset, instrs_len_bytes, landing_pad_offset, action_offset_plus_one;
+static inline const uint8_t* parse_call_site_entry(const uint8_t* ptr, const lsda_info_t* info,
+                                                   call_site_entry_t* entry) {
+    size_t instrs_start_offset, instrs_len_bytes, landing_pad_offset, action_offset_plus_one;
 
-    // TODO: think about how this whole file should work on 32-bit platforms!
-    // g++ recently changed from always doing udata4 here to using uleb128
+    // clang++ recently changed from always doing udata4 here to using uleb128, so we support both
     unsigned uleb_size;
     if (DW_EH_PE_uleb128 == info->call_site_table_entry_encoding) {
         instrs_start_offset = llvm::decodeULEB128(ptr, &uleb_size);
@@ -234,9 +208,9 @@ __attribute__((__always_inline__)) static inline const uint8_t
         ptr += uleb_size;
     } else if (DW_EH_PE_udata4 == info->call_site_table_entry_encoding) {
         // offsets are from landing pad base
-        instrs_start_offset = (uint64_t) * (const uint32_t*)ptr;
-        instrs_len_bytes = (uint64_t) * (const uint32_t*)(ptr + 4);
-        landing_pad_offset = (uint64_t) * (const uint32_t*)(ptr + 8);
+        instrs_start_offset = (size_t) * (const uint32_t*)ptr;
+        instrs_len_bytes = (size_t) * (const uint32_t*)(ptr + 4);
+        landing_pad_offset = (size_t) * (const uint32_t*)(ptr + 8);
         ptr += 12;
     } else {
         RELEASE_ASSERT(0, "expected call site table entries to use DW_EH_PE_udata4 or DW_EH_PE_uleb128");
@@ -268,8 +242,8 @@ static inline const uint8_t* first_action(const lsda_info_t* info, const call_si
     return info->action_table + entry->action_offset_plus_one - 1;
 }
 
-// returns pointer to next action, or NULL if no next action.
-// stores type filter into `*type_filter', stores number of bytes read into `*num_bytes' unless it is null.
+// Returns pointer to next action, or NULL if no next action.
+// Stores type filter into `*type_filter', stores number of bytes read into `*num_bytes', unless it is null.
 static inline const uint8_t* next_action(const uint8_t* action_ptr, int64_t* type_filter,
                                          unsigned* num_bytes = nullptr) {
     assert(type_filter);
@@ -277,7 +251,7 @@ static inline const uint8_t* next_action(const uint8_t* action_ptr, int64_t* typ
     *type_filter = llvm::decodeSLEB128(action_ptr, &leb_size);
     action_ptr += leb_size;
     total_size = leb_size;
-    int64_t offset_to_next_entry = llvm::decodeSLEB128(action_ptr, &leb_size);
+    intptr_t offset_to_next_entry = llvm::decodeSLEB128(action_ptr, &leb_size);
     total_size += leb_size;
     if (num_bytes) {
         *num_bytes = total_size;
@@ -289,14 +263,13 @@ static inline const uint8_t* next_action(const uint8_t* action_ptr, int64_t* typ
 
 // ---------- Printing things for debugging purposes ----------
 static void print_lsda(const lsda_info_t* info) {
-    uint64_t action_table_min_len_bytes = 0;
+    size_t action_table_min_len_bytes = 0;
 
-    // print call site table
-    // the call site table ends where the action table begins
+    // Print call site table.
     printf("Call site table:\n");
     const uint8_t* p = info->call_site_table;
     assert(p);
-    while (p < info->action_table) {
+    while (p < info->action_table) { // the call site table ends where the action table begins
         call_site_entry_t entry;
         p = parse_call_site_entry(p, info, &entry);
         printf("  start %p end %p landingpad %p action-plus-one %lx\n", entry.instrs_start,
@@ -357,8 +330,9 @@ static void print_frame(unw_cursor_t* cursor, const unw_proc_info_t* pip) {
     check(unw_get_reg(cursor, UNW_REG_IP, &ip));
     check(unw_get_reg(cursor, UNW_TDEP_BP, &bp));
 
-    // NB. unw_get_proc_name appears to be MUCH slower than dl_addr for getting the names of functions!
-    // but it also gets the names of more functions, so we use it for now.
+    // NB. unw_get_proc_name is MUCH slower than dl_addr for getting the names of functions, but it gets the names of
+    // more functions. However, it also has a bug that pops up when used on JITted functions, so we use dladdr for now.
+    // (I've put an assert in libunwind that'll catch, but not fix, the bug.) - rntz
 
     // {
     //     char name[500];
@@ -375,7 +349,7 @@ static void print_frame(unw_cursor_t* cursor, const unw_proc_info_t* pip) {
 
     {
         Dl_info dl_info;
-        if (dladdr((void*)ip, &dl_info)) { // returns non-zero on success, wtf?
+        if (dladdr((void*)ip, &dl_info)) { // returns non-zero on success, zero on failure
             if (!dl_info.dli_sname || strlen(dl_info.dli_sname) < 50)
                 printf("  %-50s", dl_info.dli_sname ? dl_info.dli_sname : "(unnamed)");
             else
@@ -420,11 +394,9 @@ static void print_frame(unw_cursor_t* cursor, const unw_proc_info_t* pip) {
 
 
 // ---------- Helpers for unwind_loop ----------
-__attribute__((__always_inline__)) static inline bool find_call_site_entry(const lsda_info_t* info, const uint8_t* ip,
-                                                                           call_site_entry_t* entry) {
+static inline bool find_call_site_entry(const lsda_info_t* info, const uint8_t* ip, call_site_entry_t* entry) {
     const uint8_t* p = info->call_site_table;
-    // The call site table ends where the action table begins.
-    while (p < info->action_table) {
+    while (p < info->action_table) { // The call site table ends where the action table begins.
         p = parse_call_site_entry(p, info, entry);
 
         if (VERBOSITY("cxx_unwind") >= 3) {
@@ -442,7 +414,7 @@ __attribute__((__always_inline__)) static inline bool find_call_site_entry(const
     }
 
     // If p actually overran *into* info.action_table, we have a malformed LSDA.
-    RELEASE_ASSERT(!(p > info->action_table), "Malformed LSDA; call site entry overlaps action table!");
+    ASSERT(!(p > info->action_table), "Malformed LSDA; call site entry overlaps action table!");
     return false;
 }
 
@@ -468,15 +440,12 @@ static inline NORETURN void resume(unw_cursor_t* cursor, const uint8_t* landing_
     // set rax to pointer to exception object
     // set rdx to the switch_value (0 for cleanup, otherwise an index indicating which exception handler to use)
     //
-    // TODO: assumes x86-64!
-    // maybe I should use __builtin_eh_return_data_regno() here?
+    // NB. assumes x86-64. maybe I should use __builtin_eh_return_data_regno() here?
     // but then, need to translate into UNW_* values somehow. not clear how.
     check(unw_set_reg(cursor, UNW_X86_64_RAX, (unw_word_t)exc_data));
     check(unw_set_reg(cursor, UNW_X86_64_RDX, switch_value));
 
     // resume!
-    // NOTE: according to shachaf, setcontext() - which is what libunwind uses for context-switching under the hood -
-    // does a system call per context switch, to set the signal mask. TODO: verify and measure.
     check(unw_set_reg(cursor, UNW_REG_IP, (unw_word_t)landing_pad));
     unw_resume(cursor);
     RELEASE_ASSERT(0, "unw_resume returned!");
@@ -558,23 +527,16 @@ static inline void unwind_loop(const ExcData* exc_data) {
     unw_getcontext(&uc);
     unw_init_local(&cursor, &uc);
 
-    // TODO?: need to handle unwinding through generator frames?
     while (step(&cursor) > 0) {
         unw_proc_info_t pip;
         {
-            // as it turns out, unw_get_proc_info is REALLY SLOW
-            // things to try: registering JITted procs as local_table_info instead of remote?
-            // but it seems like mostly it's just slow and there's no good way around it :(
-            // should figure out what in particular is slow
+            // NB. unw_get_proc_info is slow; a significant chunk of all time spent unwinding is spent here.
             LogTimer t_procinfo("get_proc_info", us_unwind_get_proc_info, 10);
             check(unw_get_proc_info(&cursor, &pip));
         }
         assert((pip.lsda == 0) == (pip.handler == 0));
         assert(pip.flags == 0);
 
-        // TODO: get line info for this frame!
-        // TODO: should I use PythonFrameIter for this purpose?
-        // no, it'll skip C++ frames that might need unwinding.
         if (VERBOSITY("cxx_unwind") >= 2) {
             print_frame(&cursor, &pip);
         }
@@ -588,7 +550,7 @@ static inline void unwind_loop(const ExcData* exc_data) {
                        "personality function other than __gxx_personality_v0; "
                        "don't know how to unwind through non-C++ functions");
 
-        // Ignore its actual personality and perform dispatch ourselves.
+        // Don't call __gxx_personality_v0; we perform dispatch ourselves.
         // 1. parse LSDA header
         lsda_info_t info;
         parse_lsda_header(&pip, &info);
@@ -601,12 +563,10 @@ static inline void unwind_loop(const ExcData* exc_data) {
             unw_word_t ip;
             unw_get_reg(&cursor, UNW_REG_IP, &ip);
             // ip points to the instruction *after* the instruction that caused the error - which is generally (always?)
-            // a call
-            // instruction - UNLESS we're in a signal frame, in which case it points at the instruction that caused the
-            // error.
-            // For now, we assume we're never in a signal frame. So, we decrement it by one.
+            // a call instruction - UNLESS we're in a signal frame, in which case it points at the instruction that
+            // caused the error. For now, we assume we're never in a signal frame. So, we decrement it by one.
             //
-            // TODO: can this code ever get called on a signal frame?
+            // TODO: double-check that we never hit a signal frame.
             --ip;
 
             bool found = find_call_site_entry(&info, (const uint8_t*)ip, &entry);
@@ -684,29 +644,15 @@ extern "C" void _Unwind_Resume(struct _Unwind_Exception* _exc) {
 // C++ ABI functionality
 namespace __cxxabiv1 {
 
-// TODO?: maybe we should actually use the `exc_obj' pointer passed through all these procedures instead of poisoning it
-// and using cur_thread_state every time?
-
 extern "C" void* __cxa_allocate_exception(size_t size) noexcept {
     // we should only ever be throwing ExcInfos
     ASSERT(size == sizeof(pyston::ExcInfo), "allocating exception whose size doesn't match ExcInfo");
 
-    // TODO FIXME XXX: check whether malloc()ing & free()ing stops the segfault!
-    // (for initial version, can ignore free()ing)
-    //
     // Instead of allocating memory for this exception, we return a pointer to a pre-allocated thread-local variable.
     //
-    // This location is used legitimately *ONLY* in the following short timespans:
-    // - between cxa_allocate_exception and cxa_throw
-    //
-    // - between cxa_begin_catch and when the result of cxa_begin_catch is copied out onto the stack (which it will be
-    //   if you follow the Pyston internal requirement that all catches are by-value not by-reference).
-    //
-    // TODO FIXME XXX: ^this list is inaccurate, what about _Unwind_Resume?
-    //
-    // As such, pyston::exception_ferry should never be used outside of this file.
-    //
-    // TODO: a document describing how not to fuck up exception handling in pyston
+    // This variable, pyston::exception_ferry, is used only while we are unwinding, and should not be used outside of
+    // the unwinder. Since it's a thread-local variable, we *cannot* throw any exceptions while it is live, otherwise we
+    // would clobber it and forget our old exception.
     //
     // Q: Why can't we just use cur_thread_state.curexc_{type,value,traceback}?
     //
@@ -716,31 +662,20 @@ extern "C" void* __cxa_allocate_exception(size_t size) noexcept {
     //
     // In particular, we need to unset the C API exception at an appropriate point so as not to make C-API functions
     // *think* an exception is being thrown when one isn't. The natural place is __cxa_begin_catch, BUT we need some way
-    // to communicate the exception info to the inside of the catch block - and all we get is a single lousy pointer,
-    // when we need three!
+    // to communicate the exception info to the inside of the catch block - and all we get is the return value of
+    // __cxa_begin_catch, which is a single pointer, when we need three!
     //
     // You might think we could get away with only unsetting the C-API information in __cxa_end_catch, but you'd be
     // wrong! Firstly, this would prohibit calling C-API functions inside a catch-block. Secondly, __cxa_end_catch is
     // always called when leaving a catch block, even if we're leaving it by re-raising the exception. So if we store
     // our exception info in curexc_*, and then unset these in __cxa_end_catch, then we'll wipe our exception info
     // during unwinding!
-    // return (void*) &pyston::exception_ferry;
 
     return (void*)&pyston::exception_ferry;
 }
 
-// This function is supposed to return a pointer to the exception value actually thrown. So if we threw an ExcInfo, this
-// should return an ExcInfo*. And if we catch it like so:
-//
-//     catch(ExcInfo& c) { ... }
-//
-// Then within the { ... }, `c' refers to the contents of that ExcInfo*.
-//
-// Usually, the actual pointer points to some memory allocated by __cxa_allocate_exception. In our case, we point it at
-// a thread-local variable, pyston::exception_ferry. This is rather hackish.
-//
-// TODO: document that you must always do `catch(ExcInfo e) { ... }' instead so that `e' gets copied locally and isn't
-// volatile.
+// Takes the value that resume() sent us in RAX, and returns a pointer to the exception object actually thrown. In our
+// case, these are the same, and should always be &pyston::exception_ferry.
 extern "C" void* __cxa_begin_catch(void* exc_obj_in) noexcept {
     assert(exc_obj_in);
     pyston::us_unwind_resume_catch.log(pyston::per_thread_resume_catch_timer.end());
@@ -756,23 +691,7 @@ extern "C" void* __cxa_begin_catch(void* exc_obj_in) noexcept {
 extern "C" void __cxa_end_catch() {
     if (VERBOSITY("cxx_unwind"))
         printf("***** __cxa_end_catch() *****\n");
-
-    // We DO NOT clear the Python C API error or the pyston exception ferry here. This is because __cxa_end_catch is
-    // *always* called, even when you re-throw inside a catch. For example:
-    //
-    //     catch (ExcInfo e) {
-    //         if (some_condition)
-    //             return; // error handled
-    //         throw e;    // re-propagate
-    //     }
-    //
-    //  Here, `throw e' will set pyston::exception_ferry according to `e', then invoke the unwinder. The unwinder will
-    //  discover that the function we're in has cleanup code to run. This cleanup code does nothing but invoke
-    //  __cxa_end_catch() followed by _Unwind_Resume(); its sole purpose is to ensure that __cxa_end_catch() is *always*
-    //  called on exiting a catch.
-    //
-    //  TODO: write a README on how to do exception-handling in the Pyston codebase without fucking up. NB. need to not
-    //  ever throw exns in dtors.
+    // See comment in __cxa_begin_catch for why we don't clear the exception ferry here.
 }
 
 extern "C" void __cxa_throw(void* exc_obj, std::type_info* tinfo, void (*dtor)(void*)) {

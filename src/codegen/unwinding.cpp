@@ -80,12 +80,6 @@ void parseEhFrame(uint64_t start_addr, uint64_t size, uint64_t func_addr, uint64
     int fde_length = *u32;
     u32++;
 
-    if (VERBOSITY("unwinding") >= 2 && cie_length + fde_length + 8 != size) { // XXX(rntz)
-        printf("size = %lu\n", size);
-        printf("cie_length: %d\n", cie_length);
-        printf("fde_length: %d\n", fde_length);
-        printf("cie_length + fde_length + 8 = %d\n", cie_length + fde_length + 8);
-    }
     assert(cie_length + fde_length + 8 == size && "more than one fde! (supportable, but not implemented)");
 
     int nentries = 1;
@@ -97,13 +91,14 @@ void parseEhFrame(uint64_t start_addr, uint64_t size, uint64_t func_addr, uint64
     *out_len = nentries;
 }
 
-void registerDynamicEHFrame(uint64_t code_addr, size_t code_size, uint64_t eh_frame_addr, size_t eh_frame_size) {
+void registerDynamicEhFrame(uint64_t code_addr, size_t code_size, uint64_t eh_frame_addr, size_t eh_frame_size) {
     unw_dyn_info_t* dyn_info = new unw_dyn_info_t();
     dyn_info->start_ip = code_addr;
     dyn_info->end_ip = code_addr + code_size;
-    // NB. using FORMAT_REMOTE_TABLE forces indirection through an access_mem() callback. a function named
-    // access_mem() shows up in our `perf` results! maybe there's a connection?
-    // but this only applies to JITted code! I think.
+    // TODO: It's not clear why we use UNW_INFO_FORMAT_REMOTE_TABLE instead of UNW_INFO_FORMAT_TABLE. kmod reports that
+    // he tried FORMAT_TABLE and it didn't work, but it wasn't clear why. However, using FORMAT_REMOTE_TABLE forces
+    // indirection through an access_mem() callback, and indeed, a function named access_mem() shows up in our `perf`
+    // results! So it's possible there's a performance win lurking here.
     dyn_info->format = UNW_INFO_FORMAT_REMOTE_TABLE;
 
     dyn_info->u.rti.name_ptr = 0;
@@ -266,9 +261,9 @@ public:
 
         assert(found_text);
         assert(found_eh_frame);
-        assert(text_addr == func_addr); // XXX(rntz) ???
+        assert(text_addr == func_addr);
 
-        registerDynamicEHFrame(text_addr, text_size, eh_frame_addr, eh_frame_size);
+        registerDynamicEhFrame(text_addr, text_size, eh_frame_addr, eh_frame_size);
     }
 };
 
@@ -528,12 +523,12 @@ static const LineInfo* lineInfoForFrame(PythonFrameIteratorImpl& frame_it) {
 //
 // 1. Use libunwind to produce a cursor into our stack.
 //
-// 2. For each frame in that stack, we check what function it is from. There are four options:
+// 2. Grab the next frame in the stack and check what function it is from. There are four options:
 //
 //    (a) A JIT-compiled Python function.
 //    (b) ASTInterpreter::execute() in codegen/ast_interpreter.cpp.
-//    (c) generatorEntry() in runtime/generator.cpp
-//    (d) Something else
+//    (c) generatorEntry() in runtime/generator.cpp.
+//    (d) Something else.
 //
 //    By cases:
 //
@@ -549,37 +544,11 @@ static const LineInfo* lineInfoForFrame(PythonFrameIteratorImpl& frame_it) {
 // 3. We've found a frame for our traceback, along with a CompiledFunction* and some other information about it.
 //
 //    We grab the current statement it is in (as an AST_stmt*) and use it and the CompiledFunction*'s source info to
-//    produce the line information for the traceback. For JIT-compiled functions, getting the statement involved the
+//    produce the line information for the traceback. For JIT-compiled functions, getting the statement involves the
 //    CF's location_map.
 //
-// QUESTIONS:
-// 1. Where does all this information about compiled functions come from?
-//    In particular, what needs to be done to set it up properly/maintain it?
-//    "All this information" being:
-//    (a) the entry_descriptor in CompiledFunction* that tells us whether we're in an OSR function
-//    (b) knowledge about the end address of functions via unw_get_proc_info_by_ip() in getFunctionEnd()
-//    (c) the CompiledFunction* returned by getCFForAddress()
+// 4. Unless we've hit the end of the stack, go to 2 and keep unwinding.
 //
-// 2. How does .eh_frame factor into this?
-// 3. How does libunwind's _U_dyn_register() & co factor into this?
-//
-// 4. How do I tell whether a frame has a C++ exception handler?
-//    - unw_proc_info_t.handler points to a "personality routine".
-//
-// OPEN QUESTION: How should this interface be generalized to allow other stack-walking features, such as:
-// 1. Finding and invoking exception-handlers and finally-blocks
-// 2. Generating the traceback incrementally as CPython does (only including frames between raise & handler)
-// 3. (hypothetically) C++-level debugging of Pyston itself
-// 4. Knowing when we unwind through an IC and doing the appropriate thing
-//    (in particular, decrementing the "threads in this IC" counter)
-//
-// OPEN QUESTION: If I didn't want to use C++ exceptions, how could I communicate exception-handling information to the
-//   unwinder?
-// - Maybe I can set unw_proc_info_t.handler and/or unw_proc_info_t.lsd?
-//   Not sure where that information ultimately comes from, though.
-//
-// TODO: run unwindExc() under gdb and compare the things it touches to gdb's traceback.
-// TODO: try breaking on a personality function and then raising a C++ exception!
 static StatCounter us_gettraceback("us_gettraceback");
 BoxedTraceback* getTraceback() {
     if (!ENABLE_FRAME_INTROSPECTION) {

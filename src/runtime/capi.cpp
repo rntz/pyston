@@ -643,7 +643,6 @@ void throwCAPIException() {
     raiseExcHelper(SystemError, "error return without exception set");
 }
 
-// TODO(rntz): consider if might be able to optimize this in light of new unwinder
 void checkAndThrowCAPIException() {
     Box* _type = cur_thread_state.curexc_type;
     if (!_type)
@@ -682,7 +681,7 @@ void checkAndThrowCAPIException() {
 
         RELEASE_ASSERT(value->cls == type, "unsupported");
 
-        if (tb != None) // FIXME why is this here
+        if (tb != None)
             raiseRaw(ExcInfo(value->cls, value, tb));
         raiseExc(value);
     }

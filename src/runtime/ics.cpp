@@ -20,7 +20,7 @@
 #include "codegen/memmgr.h"
 #include "codegen/patchpoints.h"
 #include "codegen/stackmaps.h"
-#include "codegen/unwinding.h" // registerDynamicEHFrame
+#include "codegen/unwinding.h" // registerDynamicEhFrame
 #include "core/common.h"
 #include "core/options.h"
 #include "core/stats.h"
@@ -140,7 +140,7 @@ static const char _eh_frame_template[] =
     // - nops
     "\x00\x00\x00\x00\x00\x00\x00" // padding
 
-    "\x00\x00\x00\x00" // terminator XXX(rntz) is this necessary?
+    "\x00\x00\x00\x00" // terminator
     ;
 #endif
 #define EH_FRAME_SIZE (sizeof(_eh_frame_template) - 1) // omit string-terminating null byte
@@ -167,7 +167,7 @@ void EHFrameManager::writeAndRegister(void* func_addr, uint64_t func_size) {
     writeTrivialEhFrame(eh_frame_addr, func_addr, func_size);
     // (EH_FRAME_SIZE - 4) to omit the 4-byte null terminator, otherwise we trip an assert in parseEhFrame.
     // TODO(rntz): can we omit the terminator in general?
-    registerDynamicEHFrame((uint64_t)func_addr, func_size, (uint64_t)eh_frame_addr, EH_FRAME_SIZE - 4);
+    registerDynamicEhFrame((uint64_t)func_addr, func_size, (uint64_t)eh_frame_addr, EH_FRAME_SIZE - 4);
     registerEHFrames((uint8_t*)eh_frame_addr, (uint64_t)eh_frame_addr, EH_FRAME_SIZE);
 }
 

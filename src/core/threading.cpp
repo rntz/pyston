@@ -35,8 +35,8 @@ namespace pyston {
 namespace threading {
 
 extern "C" {
-__thread PyThreadState cur_thread_state // <- store exception here TODO(rntz)
-    = { 0, NULL, NULL, NULL, NULL };    // not sure if we need to explicitly request zero-initialization
+__thread PyThreadState cur_thread_state
+    = { 0, NULL, NULL, NULL, NULL }; // not sure if we need to explicitly request zero-initialization
 }
 
 PthreadFastMutex threading_lock;

@@ -113,8 +113,6 @@ typedef struct _ts {
 typedef struct _ts {
     int recursion_depth;
 
-    // TODO(rntz): why don't we have exc_type?
-    // https://mail.python.org/pipermail/python-dev/2002-May/024285.html
     PyObject *curexc_type;
     PyObject *curexc_value;
     PyObject *curexc_traceback;

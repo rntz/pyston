@@ -27,8 +27,6 @@
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
 
-#define TOSTR(e) (str((e))->s.str().c_str()) // this is wrong, because of lifetime issues
-
 namespace pyston {
 
 // from http://www.nongnu.org/libunwind/man/libunwind(3).html
@@ -47,41 +45,6 @@ void showBacktrace() {
     }
 }
 
-// https://monoinfinito.wordpress.com/series/exception-handling-in-c/ is a very useful resource
-
-// auto handler_fn = (int (*)(int, int, uint64_t, void*, void*))pip.handler;
-////handler_fn(1, 1 /* _UA_SEARCH_PHASE */, 0 /* exc_class */, NULL, NULL);
-// handler_fn(2, 2 /* _UA_CLEANUP_PHASE */, 0 /* exc_class */, NULL, NULL);
-// unw_set_reg(&cursor, UNW_REG_IP, 1);
-
-// TODO testing:
-// unw_resume(&cursor);
-
-// PROBLEM: if I resume any function, I run the risk of clobbering the stack frame for unwindExc!
-// so I'll need to find some way to store any information I need to resume unwinding.
-// this is probably the reason why C++ malloc()s up an exception record for every throw
-
-// what benefits are we gaining by reimplementing this much C++ implementation behavior?
-// - can avoid "search phase"
-//   not clear how much time this gains us.
-//
-// - incremental traceback generation
-//   could we do this with RAII somehow?
-//   have a destructor that, if we're unwinding inside it, adds a line to the traceback?
-//   (would need to be guaranteed not to throw an exception.)
-//
-// - does throwing exceptions work across generators?
-
-// what are our other options?
-// - use return-code exceptions
-// - some hack with RAII to do incremental tracebacks
-// - avoid C++ exceptions entirely & use something like longjmp()/setjmp()
-
-// What do I need in order to deal with ICs?
-//
-// TODO: what the hell happens if an exception occurs inside an inline cache?
-// TODO: how even do inline caches work?
-
 void raiseRaw(const ExcInfo& e) __attribute__((__noreturn__));
 void raiseRaw(const ExcInfo& e) {
     // Should set these to None rather than null before getting here:
@@ -96,17 +59,6 @@ void raiseRaw(const ExcInfo& e) {
             printf("---- raiseRaw() called and WTFed\n");
         }
     }
-
-    // {
-    //     static bool flag = 0;   // recursion flag
-    //     if (!flag) {
-    //         flag = 1;
-    //         if (PyObject_HasAttrString(e.value, "magic_break")) {
-    //             printf("MAGIC BREAK\n");
-    //         }
-    //         flag = 0;
-    //     }
-    // }
 
     throw e;
 }
@@ -248,31 +200,15 @@ bool ExcInfo::matches(BoxedClass* cls) const {
     return isSubclass(static_cast<BoxedClass*>(this->type), cls);
 }
 
-// void raise3_(Box* exc, Box* val, Box* tb) {
-//     PyErr_NormalizeException(&exc, &val, &tb);
-//     if (tb == None)
-//         tb = getTraceback();
-//     raiseRaw(ExcInfo(exc, val, tb));
-// }
-
 // takes the three arguments of a `raise' and produces the ExcInfo to throw
 ExcInfo excInfoForRaise(Box* exc_cls, Box* exc_val, Box* exc_tb) {
     assert(exc_cls && exc_val && exc_tb); // use None for default behavior, not nullptr
     // TODO switch this to PyErr_Normalize
 
-    // printf("orig: (%s, %s, %s)\n", TOSTR(exc_cls), TOSTR(exc_val), TOSTR(exc_tb));
-    // TODO: theoretically, PyErr_NormalizeException could itself throw an exception
-    // but it would do this by setting the error, CPython-style, not by throwing it C++-style
-    // PyErr_NormalizeException(&exc_cls, &exc_val, &exc_tb);
-    // printf("normalized: (%s, %s, %s)\n", TOSTR(exc_cls), TOSTR(exc_val), TOSTR(exc_tb));
-
     if (exc_tb == None)
         exc_tb = getTraceback();
 
-    // now exc_cls is the type, exc_val the value, and exc_tb the traceback
-
     if (isSubclass(exc_cls->cls, type_cls)) {
-        // printf("  NEW STYLE\n");
         BoxedClass* c = static_cast<BoxedClass*>(exc_cls);
         if (isSubclass(c, BaseException)) {
             Box* exc_obj;
@@ -286,17 +222,13 @@ ExcInfo excInfoForRaise(Box* exc_cls, Box* exc_val, Box* exc_tb) {
                 exc_obj = runtimeCall(c, ArgPassSpec(0), NULL, NULL, NULL, NULL, NULL);
             }
 
-            // printf("ExcInfo(%s, %s, %s)\n", TOSTR(c), TOSTR(exc_obj), TOSTR(exc_tb));
             return ExcInfo(c, exc_obj, exc_tb);
         }
     }
 
     if (isSubclass(exc_cls->cls, BaseException)) {
-        // printf("  OLD STYLE\n");
         if (exc_val != None)
             raiseExcHelper(TypeError, "instance exception may not have a separate value");
-
-        // printf("ExcInfo(%s, %s, %s)\n", TOSTR(exc_cls->cls), TOSTR(exc_cls), TOSTR(exc_tb));
         return ExcInfo(exc_cls->cls, exc_cls, exc_tb);
     }
 

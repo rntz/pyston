@@ -884,7 +884,6 @@ $(call link,_release,$(OPT_OBJS),$(LDFLAGS_RELEASE),$(LLVM_RELEASE_DEPS))
 
 else
 CMAKE_DIR_DBG := $(HOME)/pyston-build-dbg
-CMAKE_DIR_VALGRIND := $(HOME)/pyston-build-valgrind
 CMAKE_DIR_RELEASE := $(HOME)/pyston-build-release
 CMAKE_SETUP_DBG := $(CMAKE_DIR_DBG)/build.ninja
 CMAKE_SETUP_RELEASE := $(CMAKE_DIR_RELEASE)/build.ninja
@@ -900,7 +899,7 @@ $(CMAKE_SETUP_RELEASE):
 	@mkdir -p $(CMAKE_DIR_RELEASE)
 	cd $(CMAKE_DIR_RELEASE); CC='clang' CXX='clang++' cmake -GNinja $(HOME)/pyston -DCMAKE_BUILD_TYPE=Release
 
-.PHONY: pyston_dbg pyston_release pyston_valgrind
+.PHONY: pyston_dbg pyston_release
 pyston_dbg: $(CMAKE_SETUP_DBG)
 	$(NINJA) -C $(CMAKE_DIR_DBG) pyston copy_stdlib copy_libpyston ext_pyston $(NINJAFLAGS)
 	ln -sf $(CMAKE_DIR_DBG)/pyston pyston_dbg
