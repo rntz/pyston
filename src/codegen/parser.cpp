@@ -973,6 +973,7 @@ AST_Module* parse_string(const char* code) {
 
     FILE* f = fopen(tmp.c_str(), "w");
     fwrite(code, 1, size, f);
+    fputc('\n', f);
     fclose(f);
 
     AST_Module* m = parse_file(tmp.c_str());
@@ -982,6 +983,7 @@ AST_Module* parse_string(const char* code) {
 }
 
 AST_Module* parse_file(const char* fn) {
+    STAT_TIMER(t0, "us_timer_cpyton_parsing");
     Timer _t("parsing");
 
     if (ENABLE_PYPA_PARSER) {
@@ -1012,9 +1014,9 @@ AST_Module* parse_file(const char* fn) {
 
 const char* getMagic() {
     if (ENABLE_PYPA_PARSER)
-        return "a\ncJ";
+        return "a\ncK";
     else
-        return "a\ncj";
+        return "a\nck";
 }
 
 #define MAGIC_STRING_LENGTH 4
@@ -1071,9 +1073,10 @@ static ParseResult _reparse(const char* fn, const std::string& cache_fn, AST_Mod
 // it's not a huge deal right now, but this caching version can significantly cut down
 // on the startup time (40ms -> 10ms).
 AST_Module* caching_parse_file(const char* fn) {
+    STAT_TIMER(t0, "us_timer_caching_parse_file");
     static StatCounter us_parsing("us_parsing");
     Timer _t("parsing");
-    _t.setExitCallback([](long t) { us_parsing.log(t); });
+    _t.setExitCallback([](uint64_t t) { us_parsing.log(t); });
 
     int code;
     std::string cache_fn = std::string(fn) + "c";

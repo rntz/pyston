@@ -20,6 +20,7 @@
 #include "core/common.h"
 #include "core/types.h"
 #include "core/util.h"
+#include "runtime/types.h"
 
 namespace pyston {
 
@@ -50,6 +51,30 @@ bool containsYield(AST* ast) {
         ast->accept(&visitor);
     }
     return visitor.containsYield;
+}
+
+// TODO
+// Combine this with the below? Basically the same logic with different string types...
+// Also should this go in this file?
+BoxedString* mangleNameBoxedString(BoxedString* id, BoxedString* private_name) {
+    assert(id);
+    assert(private_name);
+    int len = id->s.size();
+    if (len < 2 || id->s[0] != '_' || id->s[1] != '_')
+        return id;
+
+    if ((id->s[len - 2] == '_' && id->s[len - 1] == '_') || id->s.find('.') != llvm::StringRef::npos)
+        return id;
+
+    const char* p = private_name->s.data();
+    while (*p == '_') {
+        p++;
+        len--;
+    }
+    if (*p == '\0')
+        return id;
+
+    return static_cast<BoxedString*>(boxStringTwine("_" + (p + id->s)));
 }
 
 static void mangleNameInPlace(InternedString& id, const std::string* private_name,
@@ -219,8 +244,13 @@ struct ScopingAnalysis::ScopeNameUsage {
     bool child_free;
 
     ScopeNameUsage(AST* node, ScopeNameUsage* parent, ScopingAnalysis* scoping)
-        : node(node), parent(parent), scoping(scoping), nameForcingNodeImportStar(NULL), nameForcingNodeBareExec(NULL),
-          free(false), child_free(false) {
+        : node(node),
+          parent(parent),
+          scoping(scoping),
+          nameForcingNodeImportStar(NULL),
+          nameForcingNodeBareExec(NULL),
+          free(false),
+          child_free(false) {
         if (node->type == AST_TYPE::ClassDef) {
             AST_ClassDef* classdef = ast_cast<AST_ClassDef>(node);
 
@@ -278,7 +308,11 @@ private:
 public:
     ScopeInfoBase(ScopeInfo* parent, ScopingAnalysis::ScopeNameUsage* usage, AST* ast, bool usesNameLookup,
                   bool globals_from_module)
-        : parent(parent), usage(usage), ast(ast), usesNameLookup_(usesNameLookup), allDerefVarsAndInfoCached(false),
+        : parent(parent),
+          usage(usage),
+          ast(ast),
+          usesNameLookup_(usesNameLookup),
+          allDerefVarsAndInfoCached(false),
           globals_from_module(globals_from_module) {
         assert(usage);
         assert(ast);
@@ -845,7 +879,7 @@ void ScopingAnalysis::processNameUsages(ScopingAnalysis::NameUsageMap* usages) {
 }
 
 InternedStringPool& ScopingAnalysis::getInternedStrings() {
-    return interned_strings;
+    return *interned_strings;
 }
 
 ScopeInfo* ScopingAnalysis::analyzeSubtree(AST* node) {
@@ -889,19 +923,25 @@ ScopeInfo* ScopingAnalysis::getScopeInfoForNode(AST* node) {
     return analyzeSubtree(node);
 }
 
-ScopingAnalysis::ScopingAnalysis(AST_Module* m)
-    : parent_module(m), interned_strings(*m->interned_strings.get()), globals_from_module(true) {
-    scopes[m] = new ModuleScopeInfo();
-}
-
-ScopingAnalysis::ScopingAnalysis(AST_Expression* e, bool globals_from_module)
-    : interned_strings(*e->interned_strings.get()), globals_from_module(globals_from_module) {
-    // It's an expression, so it can't have a `global` statement
-    scopes[e] = new EvalExprScopeInfo(globals_from_module);
-}
-
-ScopingAnalysis::ScopingAnalysis(AST_Suite* s, bool globals_from_module)
-    : interned_strings(*s->interned_strings.get()), globals_from_module(globals_from_module) {
-    scopes[s] = new EvalExprScopeInfo(s, globals_from_module);
+ScopingAnalysis::ScopingAnalysis(AST* ast, bool globals_from_module)
+    : parent_module(NULL), globals_from_module(globals_from_module) {
+    switch (ast->type) {
+        case AST_TYPE::Module:
+            assert(globals_from_module);
+            scopes[ast] = new ModuleScopeInfo();
+            interned_strings = static_cast<AST_Module*>(ast)->interned_strings.get();
+            parent_module = static_cast<AST_Module*>(ast);
+            break;
+        case AST_TYPE::Expression:
+            scopes[ast] = new EvalExprScopeInfo(globals_from_module);
+            interned_strings = static_cast<AST_Expression*>(ast)->interned_strings.get();
+            break;
+        case AST_TYPE::Suite:
+            scopes[ast] = new EvalExprScopeInfo(ast, globals_from_module);
+            interned_strings = static_cast<AST_Suite*>(ast)->interned_strings.get();
+            break;
+        default:
+            RELEASE_ASSERT(0, "%d", ast->type);
+    }
 }
 }

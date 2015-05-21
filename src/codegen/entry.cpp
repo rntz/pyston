@@ -281,7 +281,7 @@ public:
 
         // Generate a hash for the module
         HashOStream hash_stream;
-        M->print(hash_stream, 0);
+        llvm::WriteBitcodeToFile(M, hash_stream);
         hash_before_codegen = hash_stream.getHash();
 
         llvm::SmallString<128> cache_file = cache_dir;
@@ -361,6 +361,8 @@ static void handle_sigint(int signum) {
     // TODO: this should set a flag saying a KeyboardInterrupt is pending.
     // For now, just call abort(), so that we get a traceback at least.
     fprintf(stderr, "SIGINT!\n");
+    joinRuntime();
+    Stats::dump(false);
     abort();
 }
 

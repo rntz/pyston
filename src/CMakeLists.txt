@@ -30,7 +30,6 @@ add_library(PYSTON_OBJECTS OBJECT ${OPTIONAL_SRCS}
 		capi/codecs.cpp
 		capi/descrobject.cpp
 		capi/errors.cpp
-		capi/float.cpp
 		capi/modsupport.cpp
 		capi/object.cpp
 		capi/typeobject.cpp
@@ -74,6 +73,7 @@ add_library(PYSTON_OBJECTS OBJECT ${OPTIONAL_SRCS}
 		gc/gc_alloc.cpp
 		gc/heap.cpp
 		runtime/bool.cpp
+		runtime/builtin_modules/ast.cpp
 		runtime/builtin_modules/builtins.cpp
 		runtime/builtin_modules/gc.cpp
 		runtime/builtin_modules/pyston.cpp

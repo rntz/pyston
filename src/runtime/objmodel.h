@@ -79,11 +79,11 @@ extern "C" void delitem(Box* target, Box* slice);
 extern "C" Box* getclsattr(Box* obj, const char* attr);
 extern "C" Box* unaryop(Box* operand, int op_type);
 extern "C" Box* importFrom(Box* obj, const std::string* attr);
-extern "C" Box* importStar(Box* from_module, BoxedModule* to_module);
+extern "C" Box* importStar(Box* from_module, Box* to_globals);
 extern "C" Box** unpackIntoArray(Box* obj, int64_t expected_size);
 extern "C" void assertNameDefined(bool b, const char* name, BoxedClass* exc_cls, bool local_var_msg);
 extern "C" void assertFailDerefNameDefined(const char* name);
-extern "C" void assertFail(BoxedModule* inModule, Box* msg);
+extern "C" void assertFail(Box* assertion_type, Box* msg);
 extern "C" bool isSubclass(BoxedClass* child, BoxedClass* parent);
 extern "C" BoxedClosure* createClosure(BoxedClosure* parent_closure, size_t size);
 
@@ -183,7 +183,13 @@ inline std::tuple<Box*, Box*, Box*, Box**> getTupleFromArgsArray(Box** args, int
 
 // The `globals` argument can be either a BoxedModule or a BoxedDict
 
+// Corresponds to a name lookup with GLOBAL scope.  Checks the passed globals object, then the builtins,
+// and if not found raises an exception.
 extern "C" Box* getGlobal(Box* globals, const std::string* name);
+// Checks for the name just in the passed globals object, and returns NULL if it is not found.
+// This includes if the globals object defined a custom __getattr__ method that threw an AttributeError.
+Box* getFromGlobals(Box* globals, llvm::StringRef name);
+void setGlobal(Box* globals, llvm::StringRef name, Box* value);
 extern "C" void delGlobal(Box* globals, const std::string* name);
 
 extern "C" void boxedLocalsSet(Box* boxedLocals, const char* attr, Box* val);

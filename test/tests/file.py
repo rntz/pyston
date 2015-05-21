@@ -3,6 +3,7 @@ import tempfile
 
 f = open("/dev/null")
 print repr(f.read())
+print repr(f.name)
 
 f2 = file("/dev/null")
 print repr(f2.read())
@@ -90,3 +91,11 @@ try:
         print "succeeded"
 except Exception as e:
     print e
+
+with open(fn, "w") as f:
+    f.write("123456");
+    f.truncate(3)
+with open(fn, "r") as f:
+    print f.read();
+
+print sys.stdout.closed

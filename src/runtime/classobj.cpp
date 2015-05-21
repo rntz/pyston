@@ -150,7 +150,7 @@ static Box* classobjGetattribute(Box* _cls, Box* _attr) {
     // These are special cases in CPython as well:
     if (attr->s[0] == '_' && attr->s[1] == '_') {
         if (attr->s == "__dict__")
-            return makeAttrWrapper(cls);
+            return cls->getAttrWrapper();
 
         if (attr->s == "__bases__")
             return cls->bases;
@@ -255,7 +255,7 @@ static Box* _instanceGetattribute(Box* _inst, Box* _attr, bool raise_on_missing)
     // These are special cases in CPython as well:
     if (attr->s[0] == '_' && attr->s[1] == '_') {
         if (attr->s == "__dict__")
-            return makeAttrWrapper(inst);
+            return inst->getAttrWrapper();
 
         if (attr->s == "__class__")
             return inst->inst_cls;
@@ -330,6 +330,34 @@ Box* instanceSetattr(Box* _inst, Box* _attr, Box* value) {
     }
 
     _inst->setattr(attr->s, value, NULL);
+    return None;
+}
+
+Box* instanceDelattr(Box* _inst, Box* _attr) {
+    RELEASE_ASSERT(_inst->cls == instance_cls, "");
+    BoxedInstance* inst = static_cast<BoxedInstance*>(_inst);
+
+    RELEASE_ASSERT(_attr->cls == str_cls, "");
+    BoxedString* attr = static_cast<BoxedString*>(_attr);
+
+    // These are special cases in CPython as well:
+    if (attr->s[0] == '_' && attr->s[1] == '_') {
+        if (attr->s == "__dict__")
+            raiseExcHelper(TypeError, "__dict__ must be set to a dictionary");
+
+        if (attr->s == "__class__")
+            raiseExcHelper(TypeError, "__class__ must be set to a class");
+    }
+
+    static const std::string delattr_str("__delattr__");
+    Box* delattr = classLookup(inst->inst_cls, delattr_str);
+
+    if (delattr) {
+        delattr = processDescriptor(delattr, inst, inst->inst_cls);
+        return runtimeCall(delattr, ArgPassSpec(1), _attr, NULL, NULL, NULL, NULL);
+    }
+
+    _inst->delattr(attr->s, NULL);
     return None;
 }
 
@@ -488,6 +516,88 @@ static Box* instanceHash(BoxedInstance* inst) {
     }
 }
 
+static Box* instanceIter(BoxedInstance* self) {
+    assert(self->cls == instance_cls);
+
+    PyObject* func;
+
+    if ((func = _instanceGetattribute(self, boxStrConstant("__iter__"), false)) != NULL) {
+        PyObject* res = PyEval_CallObject(func, (PyObject*)NULL);
+        if (!res)
+            throwCAPIException();
+
+        if (!PyIter_Check(res))
+            raiseExcHelper(TypeError, "__iter__ returned non-iterator of type '%.100s'", res->cls->tp_name);
+        return res;
+    }
+
+    if ((func = _instanceGetattribute(self, boxStrConstant("__getitem__"), false)) == NULL) {
+        raiseExcHelper(TypeError, "iteration over non-sequence");
+    }
+
+    Box* r = PySeqIter_New((PyObject*)self);
+    if (!r)
+        throwCAPIException();
+    return r;
+}
+
+static Box* instanceNext(BoxedInstance* inst) {
+    assert(inst->cls == instance_cls);
+
+    Box* next_func = _instanceGetattribute(inst, boxStrConstant("next"), false);
+
+    if (!next_func) {
+        // not 100% sure why this is a different error:
+        raiseExcHelper(TypeError, "instance has no next() method");
+    }
+
+    Box* r = runtimeCall(next_func, ArgPassSpec(0), NULL, NULL, NULL, NULL, NULL);
+    return r;
+}
+
+static PyObject* instance_index(PyObject* self) noexcept {
+    PyObject* func, *res;
+    /*
+    static PyObject* indexstr = NULL;
+
+    if (indexstr == NULL) {
+        indexstr = PyString_InternFromString("__index__");
+        if (indexstr == NULL)
+            return NULL;
+    }
+    */
+    if ((func = instance_getattro(self, boxString("__index__"))) == NULL) {
+        if (!PyErr_ExceptionMatches(PyExc_AttributeError))
+            return NULL;
+        PyErr_Clear();
+        PyErr_SetString(PyExc_TypeError, "object cannot be interpreted as an index");
+        return NULL;
+    }
+    res = PyEval_CallObject(func, (PyObject*)NULL);
+    Py_DECREF(func);
+    return res;
+}
+
+Box* instanceEq(Box* _inst, Box* other) {
+    RELEASE_ASSERT(_inst->cls == instance_cls, "");
+    BoxedInstance* inst = static_cast<BoxedInstance*>(_inst);
+
+    Box* func = _instanceGetattribute(inst, boxStrConstant("__eq__"), false);
+    if (!func)
+        return NotImplemented;
+    return runtimeCall(func, ArgPassSpec(1), other, NULL, NULL, NULL, NULL);
+}
+
+Box* instanceNe(Box* _inst, Box* other) {
+    RELEASE_ASSERT(_inst->cls == instance_cls, "");
+    BoxedInstance* inst = static_cast<BoxedInstance*>(_inst);
+
+    Box* func = _instanceGetattribute(inst, boxStrConstant("__ne__"), false);
+    if (!func)
+        return NotImplemented;
+    return runtimeCall(func, ArgPassSpec(1), other, NULL, NULL, NULL, NULL);
+}
+
 Box* instanceCall(Box* _inst, Box* _args, Box* _kwargs) {
     assert(_inst->cls == instance_cls);
     BoxedInstance* inst = static_cast<BoxedInstance*>(_inst);
@@ -497,6 +607,33 @@ Box* instanceCall(Box* _inst, Box* _args, Box* _kwargs) {
         raiseExcHelper(AttributeError, "%s instance has no __call__ method", inst->inst_cls->name->data());
 
     return runtimeCall(call_func, ArgPassSpec(0, 0, true, true), _args, _kwargs, NULL, NULL, NULL);
+}
+
+extern "C" PyObject* PyClass_New(PyObject* bases, PyObject* dict, PyObject* name) noexcept {
+    try {
+        if (name == NULL || !PyString_Check(name)) {
+            PyErr_SetString(PyExc_TypeError, "PyClass_New: name must be a string");
+            return NULL;
+        }
+        if (dict == NULL || !PyDict_Check(dict)) {
+            PyErr_SetString(PyExc_TypeError, "PyClass_New: dict must be a dictionary");
+            return NULL;
+        }
+
+        return runtimeCall(classobj_cls, ArgPassSpec(3), name, bases, dict, NULL, NULL);
+    } catch (ExcInfo e) {
+        setCAPIException(e);
+        return NULL;
+    }
+}
+
+extern "C" PyObject* PyMethod_New(PyObject* func, PyObject* self, PyObject* klass) noexcept {
+    try {
+        return new BoxedInstanceMethod(self, func, klass);
+    } catch (ExcInfo e) {
+        setCAPIException(e);
+        return NULL;
+    }
 }
 
 void setupClassobj() {
@@ -526,6 +663,7 @@ void setupClassobj() {
     instance_cls->giveAttr("__getattribute__",
                            new BoxedFunction(boxRTFunction((void*)instanceGetattribute, UNKNOWN, 2)));
     instance_cls->giveAttr("__setattr__", new BoxedFunction(boxRTFunction((void*)instanceSetattr, UNKNOWN, 3)));
+    instance_cls->giveAttr("__delattr__", new BoxedFunction(boxRTFunction((void*)instanceDelattr, UNKNOWN, 2)));
     instance_cls->giveAttr("__str__", new BoxedFunction(boxRTFunction((void*)instanceStr, UNKNOWN, 1)));
     instance_cls->giveAttr("__repr__", new BoxedFunction(boxRTFunction((void*)instanceRepr, UNKNOWN, 1)));
     instance_cls->giveAttr("__nonzero__", new BoxedFunction(boxRTFunction((void*)instanceNonzero, UNKNOWN, 1)));
@@ -535,11 +673,16 @@ void setupClassobj() {
     instance_cls->giveAttr("__delitem__", new BoxedFunction(boxRTFunction((void*)instanceDelitem, UNKNOWN, 2)));
     instance_cls->giveAttr("__contains__", new BoxedFunction(boxRTFunction((void*)instanceContains, UNKNOWN, 2)));
     instance_cls->giveAttr("__hash__", new BoxedFunction(boxRTFunction((void*)instanceHash, UNKNOWN, 1)));
+    instance_cls->giveAttr("__iter__", new BoxedFunction(boxRTFunction((void*)instanceIter, UNKNOWN, 1)));
+    instance_cls->giveAttr("next", new BoxedFunction(boxRTFunction((void*)instanceNext, UNKNOWN, 1)));
     instance_cls->giveAttr("__call__",
                            new BoxedFunction(boxRTFunction((void*)instanceCall, UNKNOWN, 1, 0, true, true)));
+    instance_cls->giveAttr("__eq__", new BoxedFunction(boxRTFunction((void*)instanceEq, UNKNOWN, 2)));
+    instance_cls->giveAttr("__ne__", new BoxedFunction(boxRTFunction((void*)instanceNe, UNKNOWN, 2)));
 
     instance_cls->freeze();
     instance_cls->tp_getattro = instance_getattro;
     instance_cls->tp_setattro = instance_setattro;
+    instance_cls->tp_as_number->nb_index = instance_index;
 }
 }

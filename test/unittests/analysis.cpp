@@ -27,7 +27,7 @@ TEST_F(AnalysisTest, augassign) {
     AST_Module* module = caching_parse_file(fn.c_str());
     assert(module);
 
-    ScopingAnalysis *scoping = new ScopingAnalysis(module);
+    ScopingAnalysis *scoping = new ScopingAnalysis(module, true);
 
     assert(module->body[0]->type == AST_TYPE::FunctionDef);
     AST_FunctionDef* func = static_cast<AST_FunctionDef*>(module->body[0]);
@@ -36,10 +36,10 @@ TEST_F(AnalysisTest, augassign) {
     ASSERT_FALSE(scope_info->getScopeTypeOfName(module->interned_strings->get("a")) == ScopeInfo::VarScopeType::GLOBAL);
     ASSERT_FALSE(scope_info->getScopeTypeOfName(module->interned_strings->get("b")) == ScopeInfo::VarScopeType::GLOBAL);
 
-    SourceInfo* si = new SourceInfo(createModule("augassign", fn), scoping, func, func->body, fn);
+    SourceInfo* si = new SourceInfo(createModule("augassign", fn.c_str()), scoping, func, func->body, fn);
 
     CFG* cfg = computeCFG(si, func->body);
-    LivenessAnalysis* liveness = computeLivenessInfo(cfg);
+    std::unique_ptr<LivenessAnalysis> liveness = computeLivenessInfo(cfg);
 
     //cfg->print();
 
@@ -49,7 +49,7 @@ TEST_F(AnalysisTest, augassign) {
             ASSERT_TRUE(liveness->isLiveAtEnd(module->interned_strings->get("a"), block));
     }
 
-    PhiAnalysis* phis = computeRequiredPhis(ParamNames(func), cfg, liveness, scope_info);
+    std::unique_ptr<PhiAnalysis> phis = computeRequiredPhis(ParamNames(func), cfg, liveness.get(), scope_info);
 }
 
 void doOsrTest(bool is_osr, bool i_maybe_undefined) {
@@ -57,17 +57,17 @@ void doOsrTest(bool is_osr, bool i_maybe_undefined) {
     AST_Module* module = caching_parse_file(fn.c_str());
     assert(module);
 
-    ScopingAnalysis *scoping = new ScopingAnalysis(module);
+    ScopingAnalysis *scoping = new ScopingAnalysis(module, true);
 
     assert(module->body[0]->type == AST_TYPE::FunctionDef);
     AST_FunctionDef* func = static_cast<AST_FunctionDef*>(module->body[0]);
 
     ScopeInfo* scope_info = scoping->getScopeInfoForNode(func);
-    SourceInfo* si = new SourceInfo(createModule("osr" + std::to_string((is_osr << 1) + i_maybe_undefined), fn),
+    SourceInfo* si = new SourceInfo(createModule("osr" + std::to_string((is_osr << 1) + i_maybe_undefined), fn.c_str()),
             scoping, func, func->body, fn);
 
     CFG* cfg = computeCFG(si, func->body);
-    LivenessAnalysis* liveness = computeLivenessInfo(cfg);
+    std::unique_ptr<LivenessAnalysis> liveness = computeLivenessInfo(cfg);
 
     // cfg->print();
 
@@ -83,7 +83,7 @@ void doOsrTest(bool is_osr, bool i_maybe_undefined) {
     AST_Jump* backedge = ast_cast<AST_Jump>(loop_backedge->body[0]);
     ASSERT_LE(backedge->target->idx, loop_backedge->idx);
 
-    PhiAnalysis* phis;
+    std::unique_ptr<PhiAnalysis> phis;
 
     if (is_osr) {
         OSREntryDescriptor* entry_descriptor = OSREntryDescriptor::create(NULL, backedge);
@@ -91,9 +91,9 @@ void doOsrTest(bool is_osr, bool i_maybe_undefined) {
         if (i_maybe_undefined)
             entry_descriptor->args[idi_str] = NULL;
         entry_descriptor->args[iter_str] = NULL;
-        phis = computeRequiredPhis(entry_descriptor, liveness, scope_info);
+        phis = computeRequiredPhis(entry_descriptor, liveness.get(), scope_info);
     } else {
-        phis = computeRequiredPhis(ParamNames(func), cfg, liveness, scope_info);
+        phis = computeRequiredPhis(ParamNames(func), cfg, liveness.get(), scope_info);
     }
 
     // First, verify that we require phi nodes for the block we enter into.

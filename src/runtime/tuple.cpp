@@ -23,6 +23,7 @@
 #include "core/stats.h"
 #include "core/types.h"
 #include "gc/collector.h"
+#include "runtime/capi.h"
 #include "runtime/objmodel.h"
 #include "runtime/types.h"
 #include "runtime/util.h"
@@ -118,7 +119,7 @@ extern "C" int _PyTuple_Resize(PyObject** pv, Py_ssize_t newsize) noexcept {
 }
 
 int BoxedTuple::Resize(BoxedTuple** pv, size_t newsize) noexcept {
-    assert(isSubclass((*pv)->cls, tuple_cls));
+    assert((*pv)->cls == tuple_cls);
 
     BoxedTuple* t = static_cast<BoxedTuple*>(*pv);
 
@@ -127,16 +128,12 @@ int BoxedTuple::Resize(BoxedTuple** pv, size_t newsize) noexcept {
 
     if (newsize < t->size()) {
         // XXX resize the box (by reallocating) smaller if it makes sense
-        t->nelts = newsize;
+        t->ob_size = newsize;
         return 0;
     }
 
-    BoxedTuple* resized;
-
-    if (t->cls == tuple_cls)
-        resized = new (newsize) BoxedTuple(newsize); // we want an uninitialized tuple, but this will memset it with 0.
-    else
-        resized = new (t->cls, newsize) BoxedTuple(newsize); // we need an uninitialized string, but this will memset
+    BoxedTuple* resized = new (newsize)
+        BoxedTuple(newsize); // we want an uninitialized tuple, but this will memset it with 0.
     memmove(resized->elts, t->elts, t->size());
 
     *pv = resized;
@@ -146,9 +143,12 @@ int BoxedTuple::Resize(BoxedTuple** pv, size_t newsize) noexcept {
 Box* tupleGetitem(BoxedTuple* self, Box* slice) {
     assert(self->cls == tuple_cls);
 
-    if (isSubclass(slice->cls, int_cls))
-        return tupleGetitemInt(self, static_cast<BoxedInt*>(slice));
-    else if (slice->cls == slice_cls)
+    if (PyIndex_Check(slice)) {
+        Py_ssize_t i = PyNumber_AsSsize_t(slice, PyExc_IndexError);
+        if (i == -1 && PyErr_Occurred())
+            throwCAPIException();
+        return tupleGetitemUnboxed(self, i);
+    } else if (slice->cls == slice_cls)
         return tupleGetitemSlice(self, static_cast<BoxedSlice*>(slice));
     else
         raiseExcHelper(TypeError, "tuple indices must be integers, not %s", getTypeName(slice));
@@ -168,6 +168,7 @@ Box* tupleAdd(BoxedTuple* self, Box* rhs) {
 }
 
 Box* tupleMul(BoxedTuple* self, Box* rhs) {
+    STAT_TIMER(t0, "us_timer_tupleMul");
     if (rhs->cls != int_cls) {
         raiseExcHelper(TypeError, "can't multiply sequence by non-int of type '%s'", getTypeName(rhs));
     }
@@ -337,6 +338,7 @@ Box* tupleIndex(BoxedTuple* self, Box* elt) {
 }
 
 Box* tupleHash(BoxedTuple* self) {
+    STAT_TIMER(t0, "us_timer_tupleHash");
     assert(isSubclass(self->cls, tuple_cls));
 
     int64_t rtn = 3527539;
@@ -434,8 +436,8 @@ extern "C" void tupleIteratorGCHandler(GCVisitor* v, Box* b) {
 
 
 void setupTuple() {
-    tuple_iterator_cls = BoxedHeapClass::create(type_cls, object_cls, &tupleIteratorGCHandler, 0, 0, sizeof(BoxedTuple),
-                                                false, "tuple");
+    tuple_iterator_cls = BoxedHeapClass::create(type_cls, object_cls, &tupleIteratorGCHandler, 0, 0,
+                                                sizeof(BoxedTupleIterator), false, "tuple");
 
     tuple_cls->giveAttr("__new__", new BoxedFunction(boxRTFunction((void*)tupleNew, UNKNOWN, 1, 0, true, true)));
     CLFunction* getitem = createRTFunction(2, 0, 0, 0);

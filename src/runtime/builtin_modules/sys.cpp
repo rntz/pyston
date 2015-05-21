@@ -20,6 +20,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 
+#include "capi/types.h"
 #include "codegen/unwinding.h"
 #include "core/types.h"
 #include "gc/collector.h"
@@ -124,6 +125,10 @@ Box* sysGetFilesystemEncoding() {
     if (Py_FileSystemDefaultEncoding)
         return boxStrConstant(Py_FileSystemDefaultEncoding);
     return None;
+}
+
+Box* sysGetRecursionLimit() {
+    return PyInt_FromLong(Py_GetRecursionLimit());
 }
 
 extern "C" int PySys_SetObject(const char* name, PyObject* v) noexcept {
@@ -377,12 +382,29 @@ extern "C" const char* Py_GetPlatform() noexcept {
 #endif
 }
 
+static PyObject* sys_excepthook(PyObject* self, PyObject* args) noexcept {
+    PyObject* exc, *value, *tb;
+    if (!PyArg_UnpackTuple(args, "excepthook", 3, 3, &exc, &value, &tb))
+        return NULL;
+    PyErr_Display(exc, value, tb);
+    Py_INCREF(Py_None);
+    return Py_None;
+}
+
+PyDoc_STRVAR(excepthook_doc, "excepthook(exctype, value, traceback) -> None\n"
+                             "\n"
+                             "Handle an exception by displaying it with a traceback on sys.stderr.\n");
+
+static PyMethodDef sys_methods[] = {
+    { "excepthook", sys_excepthook, METH_VARARGS, excepthook_doc },
+};
+
 void setupSys() {
     sys_modules_dict = new BoxedDict();
     gc::registerPermanentRoot(sys_modules_dict);
 
     // This is ok to call here because we've already created the sys_modules_dict
-    sys_module = createModule("sys", "__builtin__");
+    sys_module = createModule("sys");
 
     sys_module->giveAttr("modules", sys_modules_dict);
 
@@ -411,10 +433,7 @@ void setupSys() {
 
     sys_module->giveAttr("platform", boxStrConstant(Py_GetPlatform()));
 
-    llvm::SmallString<128> main_fn;
-    // TODO supposed to pass argv0, main_addr to this function:
-    main_fn = llvm::sys::fs::getMainExecutable(NULL, NULL);
-    sys_module->giveAttr("executable", boxString(main_fn.str()));
+    sys_module->giveAttr("executable", boxString(Py_GetProgramFullPath()));
 
     sys_module->giveAttr("_getframe",
                          new BoxedFunction(boxRTFunction((void*)sysGetFrame, UNKNOWN, 1, 1, false, false), { NULL }));
@@ -425,6 +444,10 @@ void setupSys() {
     sys_module->giveAttr("getfilesystemencoding",
                          new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)sysGetFilesystemEncoding, STR, 0),
                                                           "getfilesystemencoding"));
+
+    sys_module->giveAttr(
+        "getrecursionlimit",
+        new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)sysGetRecursionLimit, UNKNOWN, 0), "getrecursionlimit"));
 
     sys_module->giveAttr("meta_path", new BoxedList());
     sys_module->giveAttr("path_hooks", new BoxedList());
@@ -453,8 +476,8 @@ void setupSys() {
     sys_module->giveAttr("maxint", boxInt(PYSTON_INT_MAX));
     sys_module->giveAttr("maxsize", boxInt(PY_SSIZE_T_MAX));
 
-    sys_flags_cls = new BoxedHeapClass(object_cls, BoxedSysFlags::gcHandler, 0, 0, sizeof(BoxedSysFlags), false,
-                                       static_cast<BoxedString*>(boxString("flags")));
+    sys_flags_cls = new (0) BoxedHeapClass(object_cls, BoxedSysFlags::gcHandler, 0, 0, sizeof(BoxedSysFlags), false,
+                                           static_cast<BoxedString*>(boxString("flags")));
     sys_flags_cls->giveAttr("__new__",
                             new BoxedFunction(boxRTFunction((void*)BoxedSysFlags::__new__, UNKNOWN, 1, 0, true, true)));
 #define ADD(name)                                                                                                      \
@@ -466,8 +489,17 @@ void setupSys() {
     ADD(optimize);
 #undef ADD
 
+#define SET_SYS_FROM_STRING(key, value) sys_module->giveAttr((key), (value))
+#ifdef Py_USING_UNICODE
+    SET_SYS_FROM_STRING("maxunicode", PyInt_FromLong(PyUnicode_GetMax()));
+#endif
+
     sys_flags_cls->tp_mro = BoxedTuple::create({ sys_flags_cls, object_cls });
     sys_flags_cls->freeze();
+
+    for (auto& md : sys_methods) {
+        sys_module->giveAttr(md.ml_name, new BoxedCApiFunction(md.ml_flags, sys_module, md.ml_name, md.ml_meth));
+    }
 
     sys_module->giveAttr("flags", new BoxedSysFlags());
 }

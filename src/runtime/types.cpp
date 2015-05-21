@@ -31,6 +31,7 @@
 #include "gc/collector.h"
 #include "runtime/capi.h"
 #include "runtime/classobj.h"
+#include "runtime/dict.h"
 #include "runtime/file.h"
 #include "runtime/ics.h"
 #include "runtime/iterobject.h"
@@ -78,6 +79,7 @@ extern "C" void init_csv();
 extern "C" void init_ssl();
 extern "C" void init_sqlite3();
 extern "C" void PyMarshal_Init();
+extern "C" void initstrop();
 
 namespace pyston {
 
@@ -93,7 +95,7 @@ bool IN_SHUTDOWN = false;
 extern "C" PyObject* PystonType_GenericAlloc(BoxedClass* cls, Py_ssize_t nitems) noexcept {
     assert(cls);
 
-    const size_t size = _PyObject_VAR_SIZE(cls, nitems + 1);
+    const size_t size = _PyObject_VAR_SIZE(cls, nitems);
 
 #ifndef NDEBUG
 #if 0
@@ -131,7 +133,10 @@ extern "C" PyObject* PystonType_GenericAlloc(BoxedClass* cls, Py_ssize_t nitems)
 
     Box* rtn = static_cast<Box*>(mem);
 
-    PyObject_Init(rtn, cls);
+    if (cls->tp_itemsize != 0)
+        static_cast<BoxVar*>(rtn)->ob_size = nitems;
+
+    PyObject_INIT(rtn, cls);
     assert(rtn->cls);
 
     return rtn;
@@ -139,7 +144,7 @@ extern "C" PyObject* PystonType_GenericAlloc(BoxedClass* cls, Py_ssize_t nitems)
 
 extern "C" PyObject* PyType_GenericAlloc(PyTypeObject* type, Py_ssize_t nitems) noexcept {
     PyObject* obj;
-    const size_t size = _PyObject_VAR_SIZE(type, nitems + 1);
+    const size_t size = _PyObject_VAR_SIZE(type, nitems);
     /* note that we need to add one, for the sentinel */
 
     if (PyType_IS_GC(type))
@@ -174,9 +179,21 @@ extern "C" PyObject* _PyObject_New(PyTypeObject* tp) noexcept {
 }
 
 // Analogue of PyType_GenericNew
+void* BoxVar::operator new(size_t size, BoxedClass* cls, size_t nitems) {
+    assert(cls);
+    ASSERT(cls->tp_basicsize >= size, "%s", cls->tp_name);
+    assert(cls->tp_itemsize > 0);
+    assert(cls->tp_alloc);
+
+    void* mem = cls->tp_alloc(cls, nitems);
+    RELEASE_ASSERT(mem, "");
+    return mem;
+}
+
 void* Box::operator new(size_t size, BoxedClass* cls) {
     assert(cls);
     ASSERT(cls->tp_basicsize >= size, "%s", cls->tp_name);
+    assert(cls->tp_itemsize == 0);
     assert(cls->tp_alloc);
 
     void* mem = cls->tp_alloc(cls, 0);
@@ -271,13 +288,12 @@ Box* Box::nextIC() {
 std::string builtinStr("__builtin__");
 
 extern "C" BoxedFunctionBase::BoxedFunctionBase(CLFunction* f)
-    : in_weakreflist(NULL), f(f), closure(NULL), isGenerator(false), ndefaults(0), defaults(NULL), modname(NULL),
-      name(NULL), doc(NULL) {
+    : in_weakreflist(NULL), f(f), closure(NULL), ndefaults(0), defaults(NULL), modname(NULL), name(NULL), doc(NULL) {
     if (f->source) {
         this->modname = PyDict_GetItemString(getGlobalsDict(), "__name__");
         this->doc = f->source->getDocString();
     } else {
-        this->modname = boxStringPtr(&builtinStr);
+        this->modname = PyString_InternFromString("__builtin__");
         this->doc = None;
     }
 
@@ -285,9 +301,8 @@ extern "C" BoxedFunctionBase::BoxedFunctionBase(CLFunction* f)
 }
 
 extern "C" BoxedFunctionBase::BoxedFunctionBase(CLFunction* f, std::initializer_list<Box*> defaults,
-                                                BoxedClosure* closure, bool isGenerator)
-    : in_weakreflist(NULL), f(f), closure(closure), isGenerator(isGenerator), ndefaults(0), defaults(NULL),
-      modname(NULL), name(NULL), doc(NULL) {
+                                                BoxedClosure* closure)
+    : in_weakreflist(NULL), f(f), closure(closure), ndefaults(0), defaults(NULL), modname(NULL), name(NULL), doc(NULL) {
     if (defaults.size()) {
         // make sure to initialize defaults first, since the GC behavior is triggered by ndefaults,
         // and a GC can happen within this constructor:
@@ -300,7 +315,7 @@ extern "C" BoxedFunctionBase::BoxedFunctionBase(CLFunction* f, std::initializer_
         this->modname = PyDict_GetItemString(getGlobalsDict(), "__name__");
         this->doc = f->source->getDocString();
     } else {
-        this->modname = boxStringPtr(&builtinStr);
+        this->modname = PyString_InternFromString("__builtin__");
         this->doc = None;
     }
 
@@ -310,9 +325,8 @@ extern "C" BoxedFunctionBase::BoxedFunctionBase(CLFunction* f, std::initializer_
 BoxedFunction::BoxedFunction(CLFunction* f) : BoxedFunction(f, {}) {
 }
 
-BoxedFunction::BoxedFunction(CLFunction* f, std::initializer_list<Box*> defaults, BoxedClosure* closure,
-                             bool isGenerator, Box* globals)
-    : BoxedFunctionBase(f, defaults, closure, isGenerator) {
+BoxedFunction::BoxedFunction(CLFunction* f, std::initializer_list<Box*> defaults, BoxedClosure* closure, Box* globals)
+    : BoxedFunctionBase(f, defaults, closure) {
 
     assert((!globals) == (!f->source || f->source->scoping->areGlobalsFromModule()));
     this->globals = globals;
@@ -333,8 +347,8 @@ BoxedBuiltinFunctionOrMethod::BoxedBuiltinFunctionOrMethod(CLFunction* f, const 
 
 BoxedBuiltinFunctionOrMethod::BoxedBuiltinFunctionOrMethod(CLFunction* f, const char* name,
                                                            std::initializer_list<Box*> defaults, BoxedClosure* closure,
-                                                           bool isGenerator, const char* doc)
-    : BoxedFunctionBase(f, defaults, closure, isGenerator) {
+                                                           const char* doc)
+    : BoxedFunctionBase(f, defaults, closure) {
 
     assert(name);
     this->name = static_cast<BoxedString*>(boxString(name));
@@ -381,13 +395,6 @@ static void functionDtor(Box* b) {
     self->dependent_ics.~ICInvalidator();
 }
 
-// TODO(kmod): builtin modules are not supposed to have a __file__ attribute
-BoxedModule::BoxedModule(const std::string& name, const std::string& fn, const char* doc) {
-    this->giveAttr("__name__", boxString(name));
-    this->giveAttr("__file__", boxString(fn));
-    this->giveAttr("__doc__", doc ? boxStrConstant(doc) : None);
-}
-
 std::string BoxedModule::name() {
     Box* name = this->getattr("__name__");
     if (!name || name->cls != str_cls) {
@@ -420,12 +427,12 @@ extern "C" void moduleGCHandler(GCVisitor* v, Box* b) {
 // This mustn't throw; our IR generator generates calls to it without "invoke" even when there are exception handlers /
 // finally-blocks in scope.
 // TODO: should we use C++11 `noexcept' here?
-extern "C" Box* boxCLFunction(CLFunction* f, BoxedClosure* closure, bool isGenerator, Box* globals,
+extern "C" Box* boxCLFunction(CLFunction* f, BoxedClosure* closure, Box* globals,
                               std::initializer_list<Box*> defaults) {
     if (closure)
         assert(closure->cls == closure_cls);
 
-    return new BoxedFunction(f, defaults, closure, isGenerator, globals);
+    return new BoxedFunction(f, defaults, closure, globals);
 }
 
 extern "C" CLFunction* unboxCLFunction(Box* b) {
@@ -446,6 +453,14 @@ extern "C" void boxGCHandler(GCVisitor* v, Box* b) {
 
         if (b->cls->instancesHaveDictAttrs()) {
             RELEASE_ASSERT(0, "Shouldn't all of these objects be conservatively scanned?");
+        }
+
+        if (b->cls->tp_flags & Py_TPFLAGS_HEAPTYPE) {
+            BoxedHeapClass* heap_cls = static_cast<BoxedHeapClass*>(b->cls);
+            BoxedHeapClass::SlotOffset* slotOffsets = heap_cls->slotOffsets();
+            for (int i = 0; i < heap_cls->nslots(); i++) {
+                v->visit(*((Box**)((char*)b + slotOffsets[i])));
+            }
         }
     } else {
         assert(type_cls == NULL || b == type_cls);
@@ -477,7 +492,7 @@ extern "C" void typeGCHandler(GCVisitor* v, Box* b) {
 
 static Box* typeDict(Box* obj, void* context) {
     if (obj->cls->instancesHaveHCAttrs())
-        return makeAttrWrapper(obj);
+        return obj->getAttrWrapper();
     if (obj->cls->instancesHaveDictAttrs())
         return obj->getDict();
     abort();
@@ -515,10 +530,9 @@ extern "C" void instancemethodGCHandler(GCVisitor* v, Box* b) {
 
     BoxedInstanceMethod* im = (BoxedInstanceMethod*)b;
 
-    if (im->obj) {
-        v->visit(im->obj);
-    }
+    v->visit(im->obj);
     v->visit(im->func);
+    v->visit(im->im_class);
 }
 
 extern "C" void propertyGCHandler(GCVisitor* v, Box* b) {
@@ -654,7 +668,7 @@ extern "C" void closureGCHandler(GCVisitor* v, Box* b) {
 extern "C" {
 BoxedClass* object_cls, *type_cls, *none_cls, *bool_cls, *int_cls, *float_cls,
     * str_cls = NULL, *function_cls, *instancemethod_cls, *list_cls, *slice_cls, *module_cls, *dict_cls, *tuple_cls,
-      *file_cls, *member_cls, *closure_cls, *generator_cls, *complex_cls, *basestring_cls, *property_cls,
+      *file_cls, *member_descriptor_cls, *closure_cls, *generator_cls, *complex_cls, *basestring_cls, *property_cls,
       *staticmethod_cls, *classmethod_cls, *attrwrapper_cls, *pyston_getset_cls, *capi_getset_cls,
       *builtin_function_or_method_cls, *attrwrapperiter_cls, *set_cls, *frozenset_cls;
 
@@ -714,15 +728,15 @@ extern "C" Box* createUserClass(const std::string* name, Box* _bases, Box* _attr
     }
 }
 
-extern "C" Box* boxInstanceMethod(Box* obj, Box* func) {
+extern "C" Box* boxInstanceMethod(Box* obj, Box* func, Box* type) {
     static StatCounter num_ims("num_instancemethods");
     num_ims.log();
 
-    return new BoxedInstanceMethod(obj, func);
+    return new BoxedInstanceMethod(obj, func, type);
 }
 
-extern "C" Box* boxUnboundInstanceMethod(Box* func) {
-    return new BoxedInstanceMethod(NULL, func);
+extern "C" Box* boxUnboundInstanceMethod(Box* func, Box* type) {
+    return new BoxedInstanceMethod(NULL, func, type);
 }
 
 extern "C" BoxedString* noneRepr(Box* v) {
@@ -772,8 +786,8 @@ static Box* functionGet(BoxedFunction* self, Box* inst, Box* owner) {
     RELEASE_ASSERT(self->cls == function_cls, "");
 
     if (inst == None)
-        return boxUnboundInstanceMethod(self);
-    return boxInstanceMethod(inst, self);
+        inst = NULL;
+    return new BoxedInstanceMethod(inst, self, owner);
 }
 
 static Box* functionCall(BoxedFunction* self, Box* args, Box* kwargs) {
@@ -792,7 +806,8 @@ static Box* functionCall(BoxedFunction* self, Box* args, Box* kwargs) {
 static Box* funcName(Box* b, void*) {
     assert(b->cls == function_cls);
     BoxedFunction* func = static_cast<BoxedFunction*>(b);
-    RELEASE_ASSERT(func->name != NULL, "func->name is not set");
+    if (func->name == NULL)
+        return boxString("<unknown function name>");
     return func->name;
 }
 
@@ -822,7 +837,6 @@ static Box* builtinFunctionOrMethodName(Box* b, void*) {
 static Box* functionCode(Box* self, void*) {
     assert(self->cls == function_cls);
     BoxedFunction* func = static_cast<BoxedFunction*>(self);
-    // This fails "f.func_code is f.func_code"
     return codeForFunction(func);
 }
 
@@ -832,6 +846,44 @@ static Box* functionDefaults(Box* self, void*) {
     if (!func->ndefaults)
         return None;
     return BoxedTuple::create(func->ndefaults, &func->defaults->elts[0]);
+}
+
+static Box* functionGlobals(Box* self, void*) {
+    assert(self->cls == function_cls);
+    BoxedFunction* func = static_cast<BoxedFunction*>(self);
+    if (func->globals) {
+        assert(!func->f->source || !func->f->source->scoping->areGlobalsFromModule());
+        return func->globals;
+    }
+    assert(func->f->source);
+    assert(func->f->source->scoping->areGlobalsFromModule());
+    return getattr(func->f->source->parent_module, "__dict__");
+}
+
+static void functionSetDefaults(Box* b, Box* v, void*) {
+    RELEASE_ASSERT(v, "can't delete __defaults__");
+
+    assert(b->cls == function_cls);
+    BoxedFunction* func = static_cast<BoxedFunction*>(b);
+
+    if (v == None)
+        v = EmptyTuple;
+
+    if (!isSubclass(v->cls, tuple_cls)) {
+        raiseExcHelper(TypeError, "__defaults__ must be set to a tuple object");
+    }
+
+    BoxedTuple* t = static_cast<BoxedTuple*>(v);
+
+    if (t->size() == func->ndefaults) {
+        for (int i = 0; i < func->ndefaults; i++) {
+            func->defaults->elts[i] = t->elts[i];
+        }
+        return;
+    } else {
+        RELEASE_ASSERT(0, "can't change number of defaults on a function for now");
+    }
+    abort();
 }
 
 static Box* functionNonzero(BoxedFunction* self) {
@@ -892,9 +944,14 @@ Box* instancemethodGet(BoxedInstanceMethod* self, Box* obj, Box* type) {
         return self;
     }
 
-    // TODO subclass test
+    if (!PyObject_IsSubclass(type, self->im_class)) {
+        return self;
+    }
 
-    return new BoxedInstanceMethod(obj, self->func);
+    if (obj == None)
+        obj = NULL;
+
+    return new BoxedInstanceMethod(obj, self->func, self->im_class);
 }
 
 Box* instancemethodNew(BoxedClass* cls, Box* func, Box* self, Box** args) {
@@ -911,14 +968,49 @@ Box* instancemethodNew(BoxedClass* cls, Box* func, Box* self, Box** args) {
         return NULL;
     }
 
-    return new BoxedInstanceMethod(self, func);
+    return new BoxedInstanceMethod(self, func, classObj);
 }
 
-Box* instancemethodRepr(BoxedInstanceMethod* self) {
-    if (self->obj)
-        return boxStrConstant("<bound instancemethod object>");
-    else
-        return boxStrConstant("<unbound instancemethod object>");
+// Modified from cpython, Objects/object.c, instancemethod_repr
+static Box* instancemethodRepr(Box* b) {
+    assert(isSubclass(b->cls, instancemethod_cls));
+    BoxedInstanceMethod* a = static_cast<BoxedInstanceMethod*>(b);
+    Box* self = a->obj;
+    Box* func = a->func;
+    Box* klass = a->im_class;
+    Box* funcname = NULL, * klassname = NULL, * result = NULL;
+    const char* sfuncname = "?", * sklassname = "?";
+
+    funcname = getattrInternal(func, "__name__", NULL);
+    if (funcname != NULL) {
+        if (!PyString_Check(funcname)) {
+            funcname = NULL;
+        } else
+            sfuncname = PyString_AS_STRING(funcname);
+    }
+
+    if (klass == NULL) {
+        klassname = NULL;
+    } else {
+        klassname = getattrInternal(klass, "__name__", NULL);
+        if (klassname != NULL) {
+            if (!PyString_Check(klassname)) {
+                klassname = NULL;
+            } else {
+                sklassname = PyString_AS_STRING(klassname);
+            }
+        }
+    }
+
+    if (self == NULL)
+        result = PyString_FromFormat("<unbound method %s.%s>", sklassname, sfuncname);
+    else {
+        // This was a CPython comment: /* XXX Shouldn't use repr() here! */
+        Box* selfrepr = repr(self);
+        assert(PyString_Check(selfrepr));
+        result = PyString_FromFormat("<bound method %s.%s of %s>", sklassname, sfuncname, PyString_AS_STRING(selfrepr));
+    }
+    return result;
 }
 
 Box* instancemethodEq(BoxedInstanceMethod* self, Box* rhs) {
@@ -951,21 +1043,98 @@ Box* sliceRepr(BoxedSlice* self) {
 
 extern "C" int PySlice_GetIndices(PySliceObject* r, Py_ssize_t length, Py_ssize_t* start, Py_ssize_t* stop,
                                   Py_ssize_t* step) noexcept {
-    Py_FatalError("unimplemented");
+    /* XXX support long ints */
+    if (r->step == Py_None) {
+        *step = 1;
+    } else {
+        if (!PyInt_Check(r->step) && !PyLong_Check(r->step))
+            return -1;
+        *step = PyInt_AsSsize_t(r->step);
+    }
+    if (r->start == Py_None) {
+        *start = *step < 0 ? length - 1 : 0;
+    } else {
+        if (!PyInt_Check(r->start) && !PyLong_Check(r->step))
+            return -1;
+        *start = PyInt_AsSsize_t(r->start);
+        if (*start < 0)
+            *start += length;
+    }
+    if (r->stop == Py_None) {
+        *stop = *step < 0 ? -1 : length;
+    } else {
+        if (!PyInt_Check(r->stop) && !PyLong_Check(r->step))
+            return -1;
+        *stop = PyInt_AsSsize_t(r->stop);
+        if (*stop < 0)
+            *stop += length;
+    }
+    if (*stop > length)
+        return -1;
+    if (*start >= length)
+        return -1;
+    if (*step == 0)
+        return -1;
+    return 0;
 }
 
 extern "C" int PySlice_GetIndicesEx(PySliceObject* _r, Py_ssize_t length, Py_ssize_t* start, Py_ssize_t* stop,
                                     Py_ssize_t* step, Py_ssize_t* slicelength) noexcept {
-    try {
-        BoxedSlice* r = (BoxedSlice*)_r;
-        assert(r->cls == slice_cls);
-        // parseSlice has the exact same behaviour as CPythons PySlice_GetIndicesEx apart from throwing c++ exceptions
-        // on error.
-        parseSlice(r, length, start, stop, step, slicelength);
-    } catch (ExcInfo e) {
-        setCAPIException(e);
-        return -1;
+    BoxedSlice* r = (BoxedSlice*)_r;
+    RELEASE_ASSERT(r->cls == slice_cls, "");
+
+    /* this is harder to get right than you might think */
+
+    Py_ssize_t defstart, defstop;
+
+    if (r->step == Py_None) {
+        *step = 1;
+    } else {
+        if (!_PyEval_SliceIndex(r->step, step))
+            return -1;
+        if (*step == 0) {
+            PyErr_SetString(PyExc_ValueError, "slice step cannot be zero");
+            return -1;
+        }
     }
+
+    defstart = *step < 0 ? length - 1 : 0;
+    defstop = *step < 0 ? -1 : length;
+
+    if (r->start == Py_None) {
+        *start = defstart;
+    } else {
+        if (!_PyEval_SliceIndex(r->start, start))
+            return -1;
+        if (*start < 0)
+            *start += length;
+        if (*start < 0)
+            *start = (*step < 0) ? -1 : 0;
+        if (*start >= length)
+            *start = (*step < 0) ? length - 1 : length;
+    }
+
+    if (r->stop == Py_None) {
+        *stop = defstop;
+    } else {
+        if (!_PyEval_SliceIndex(r->stop, stop))
+            return -1;
+        if (*stop < 0)
+            *stop += length;
+        if (*stop < 0)
+            *stop = (*step < 0) ? -1 : 0;
+        if (*stop >= length)
+            *stop = (*step < 0) ? length - 1 : length;
+    }
+
+    if ((*step < 0 && *stop >= *start) || (*step > 0 && *start >= *stop)) {
+        *slicelength = 0;
+    } else if (*step < 0) {
+        *slicelength = (*stop - *start + 1) / (*step) + 1;
+    } else {
+        *slicelength = (*stop - *start - 1) / (*step) + 1;
+    }
+
     return 0;
 }
 
@@ -1029,9 +1198,7 @@ static void typeSetModule(Box* _type, PyObject* value, void* context) {
 
 Box* typeHash(BoxedClass* self) {
     assert(isSubclass(self->cls, type_cls));
-
-    // This is how CPython defines it; seems reasonable enough:
-    return boxInt(reinterpret_cast<intptr_t>(self) >> 4);
+    return boxInt(_Py_HashPointer(self));
 }
 
 static PyObject* type_subclasses(PyTypeObject* type, PyObject* args_ignored) noexcept {
@@ -1076,15 +1243,19 @@ Box* typeMro(BoxedClass* self) {
     return r;
 }
 
-Box* moduleNew(BoxedClass* cls, BoxedString* name, BoxedString* fn) {
-    RELEASE_ASSERT(isSubclass(cls, module_cls), "");
+Box* moduleInit(BoxedModule* self, Box* name, Box* doc) {
+    RELEASE_ASSERT(isSubclass(self->cls, module_cls), "");
     RELEASE_ASSERT(name->cls == str_cls, "");
-    RELEASE_ASSERT(!fn || fn->cls == str_cls, "");
+    RELEASE_ASSERT(!doc || doc->cls == str_cls, "");
 
-    if (fn)
-        return new (cls) BoxedModule(name->s, fn->s);
-    else
-        return new (cls) BoxedModule(name->s, "__builtin__");
+    HCAttrs* attrs = self->getHCAttrsPtr();
+    RELEASE_ASSERT(attrs->hcls->attributeArraySize() == 0, "");
+    attrs->hcls = HiddenClass::makeSingleton();
+
+    self->giveAttr("__name__", name);
+    self->giveAttr("__doc__", doc ? doc : boxString(""));
+
+    return None;
 }
 
 Box* moduleRepr(BoxedModule* m) {
@@ -1151,7 +1322,8 @@ public:
         // This check doesn't cover all cases, since an attrwrapper could be created around
         // a normal object which then becomes dict-backed, so we RELEASE_ASSERT later
         // that that doesn't happen.
-        assert(b->getHCAttrsPtr()->hcls->type == HiddenClass::NORMAL);
+        assert(b->getHCAttrsPtr()->hcls->type == HiddenClass::NORMAL
+               || b->getHCAttrsPtr()->hcls->type == HiddenClass::SINGLETON);
     }
 
     DEFAULT_CLASS(attrwrapper_cls);
@@ -1166,6 +1338,8 @@ public:
     }
 
     static Box* setitem(Box* _self, Box* _key, Box* value) {
+        STAT_TIMER(t0, "us_timer_AttrWrapper_setitem");
+
         RELEASE_ASSERT(_self->cls == attrwrapper_cls, "");
         AttrWrapper* self = static_cast<AttrWrapper*>(_self);
 
@@ -1178,6 +1352,7 @@ public:
     }
 
     static Box* setdefault(Box* _self, Box* _key, Box* value) {
+        STAT_TIMER(t0, "us_timer_AttrWrapper_setdefault");
         RELEASE_ASSERT(_self->cls == attrwrapper_cls, "");
         AttrWrapper* self = static_cast<AttrWrapper*>(_self);
 
@@ -1193,6 +1368,7 @@ public:
     }
 
     static Box* get(Box* _self, Box* _key, Box* def) {
+        STAT_TIMER(t0, "us_timer_AttrWrapper_get");
         RELEASE_ASSERT(_self->cls == attrwrapper_cls, "");
         AttrWrapper* self = static_cast<AttrWrapper*>(_self);
 
@@ -1207,6 +1383,7 @@ public:
     }
 
     static Box* getitem(Box* _self, Box* _key) {
+        STAT_TIMER(t0, "us_timer_AttrWrapper_getitem");
         RELEASE_ASSERT(_self->cls == attrwrapper_cls, "");
         AttrWrapper* self = static_cast<AttrWrapper*>(_self);
 
@@ -1240,6 +1417,7 @@ public:
     }
 
     static Box* delitem(Box* _self, Box* _key) {
+        STAT_TIMER(t0, "us_timer_AttrWrapper_delitem");
         RELEASE_ASSERT(_self->cls == attrwrapper_cls, "");
         AttrWrapper* self = static_cast<AttrWrapper*>(_self);
 
@@ -1264,9 +1442,9 @@ public:
         os << "attrwrapper({";
 
         HCAttrs* attrs = self->b->getHCAttrsPtr();
-        RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL, "");
+        RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL || attrs->hcls->type == HiddenClass::SINGLETON, "");
         bool first = true;
-        for (const auto& p : attrs->hcls->getAttrOffsets()) {
+        for (const auto& p : attrs->hcls->getStrAttrOffsets()) {
             if (!first)
                 os << ", ";
             first = false;
@@ -1297,40 +1475,57 @@ public:
         BoxedList* rtn = new BoxedList();
 
         HCAttrs* attrs = self->b->getHCAttrsPtr();
-        RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL, "");
-        for (const auto& p : attrs->hcls->getAttrOffsets()) {
+        RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL || attrs->hcls->type == HiddenClass::SINGLETON, "");
+        for (const auto& p : attrs->hcls->getStrAttrOffsets()) {
             listAppend(rtn, boxString(p.first()));
         }
         return rtn;
     }
 
     static Box* values(Box* _self) {
+        STAT_TIMER(t0, "us_timer_AttrWrapper_values");
         RELEASE_ASSERT(_self->cls == attrwrapper_cls, "");
         AttrWrapper* self = static_cast<AttrWrapper*>(_self);
 
         BoxedList* rtn = new BoxedList();
 
         HCAttrs* attrs = self->b->getHCAttrsPtr();
-        RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL, "");
-        for (const auto& p : attrs->hcls->getAttrOffsets()) {
+        RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL || attrs->hcls->type == HiddenClass::SINGLETON, "");
+        for (const auto& p : attrs->hcls->getStrAttrOffsets()) {
             listAppend(rtn, attrs->attr_list->attrs[p.second]);
         }
         return rtn;
     }
 
     static Box* items(Box* _self) {
+        STAT_TIMER(t0, "us_timer_AttrWrapper_items");
         RELEASE_ASSERT(_self->cls == attrwrapper_cls, "");
         AttrWrapper* self = static_cast<AttrWrapper*>(_self);
 
         BoxedList* rtn = new BoxedList();
 
         HCAttrs* attrs = self->b->getHCAttrsPtr();
-        RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL, "");
-        for (const auto& p : attrs->hcls->getAttrOffsets()) {
+        RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL || attrs->hcls->type == HiddenClass::SINGLETON, "");
+        for (const auto& p : attrs->hcls->getStrAttrOffsets()) {
             BoxedTuple* t = BoxedTuple::create({ boxString(p.first()), attrs->attr_list->attrs[p.second] });
             listAppend(rtn, t);
         }
         return rtn;
+    }
+
+    static Box* iterkeys(Box* _self) {
+        Box* r = AttrWrapper::keys(_self);
+        return getiter(r);
+    }
+
+    static Box* itervalues(Box* _self) {
+        Box* r = AttrWrapper::values(_self);
+        return getiter(r);
+    }
+
+    static Box* iteritems(Box* _self) {
+        Box* r = AttrWrapper::items(_self);
+        return getiter(r);
     }
 
     static Box* copy(Box* _self) {
@@ -1340,8 +1535,8 @@ public:
         BoxedDict* rtn = new BoxedDict();
 
         HCAttrs* attrs = self->b->getHCAttrsPtr();
-        RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL, "");
-        for (const auto& p : attrs->hcls->getAttrOffsets()) {
+        RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL || attrs->hcls->type == HiddenClass::SINGLETON, "");
+        for (const auto& p : attrs->hcls->getStrAttrOffsets()) {
             rtn->d[boxString(p.first())] = attrs->attr_list->attrs[p.second];
         }
         return rtn;
@@ -1352,31 +1547,54 @@ public:
         AttrWrapper* self = static_cast<AttrWrapper*>(_self);
 
         HCAttrs* attrs = self->b->getHCAttrsPtr();
-        RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL, "");
-        return boxInt(attrs->hcls->getAttrOffsets().size());
+        RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL || attrs->hcls->type == HiddenClass::SINGLETON, "");
+        return boxInt(attrs->hcls->getStrAttrOffsets().size());
     }
 
-    static Box* update(Box* _self, Box* _container) {
+    static Box* update(Box* _self, BoxedTuple* args, BoxedDict* kwargs) {
+        STAT_TIMER(t0, "us_timer_AttrWrapper_update");
         RELEASE_ASSERT(_self->cls == attrwrapper_cls, "");
         AttrWrapper* self = static_cast<AttrWrapper*>(_self);
 
-        if (_container->cls == attrwrapper_cls) {
-            AttrWrapper* container = static_cast<AttrWrapper*>(_container);
-            HCAttrs* attrs = container->b->getHCAttrsPtr();
+        assert(args->cls == tuple_cls);
+        assert(kwargs);
+        assert(kwargs->cls == dict_cls);
 
-            RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL, "");
-            for (const auto& p : attrs->hcls->getAttrOffsets()) {
-                self->b->setattr(p.first(), attrs->attr_list->attrs[p.second], NULL);
-            }
-        } else if (_container->cls == dict_cls) {
-            BoxedDict* container = static_cast<BoxedDict*>(_container);
+        RELEASE_ASSERT(args->size() <= 1, ""); // should throw a TypeError
 
-            for (const auto& p : container->d) {
-                AttrWrapper::setitem(self, p.first, p.second);
+        auto handle = [&](Box* _container) {
+            if (_container->cls == attrwrapper_cls) {
+                AttrWrapper* container = static_cast<AttrWrapper*>(_container);
+                HCAttrs* attrs = container->b->getHCAttrsPtr();
+
+                RELEASE_ASSERT(attrs->hcls->type == HiddenClass::NORMAL || attrs->hcls->type == HiddenClass::SINGLETON,
+                               "");
+                for (const auto& p : attrs->hcls->getStrAttrOffsets()) {
+                    self->b->setattr(p.first(), attrs->attr_list->attrs[p.second], NULL);
+                }
+            } else {
+                // The update rules are too complicated to be worth duplicating here;
+                // just create a new dict object and defer to dictUpdate.
+                // Hopefully this does not happen very often.
+                if (!isSubclass(_container->cls, dict_cls)) {
+                    BoxedDict* new_container = new BoxedDict();
+                    dictUpdate(new_container, BoxedTuple::create({ _container }), new BoxedDict());
+                    _container = new_container;
+                }
+                assert(isSubclass(_container->cls, dict_cls));
+                BoxedDict* container = static_cast<BoxedDict*>(_container);
+
+                for (const auto& p : container->d) {
+                    AttrWrapper::setitem(self, p.first, p.second);
+                }
             }
-        } else {
-            RELEASE_ASSERT(0, "not implemented: %s", _container->cls->tp_name);
+        };
+
+        for (auto e : *args) {
+            handle(e);
         }
+        handle(kwargs);
+
         return None;
     }
 
@@ -1393,36 +1611,54 @@ public:
 AttrWrapperIter::AttrWrapperIter(AttrWrapper* aw) {
     hcls = aw->b->getHCAttrsPtr()->hcls;
     assert(hcls);
-    RELEASE_ASSERT(hcls->type == HiddenClass::NORMAL, "");
-    it = hcls->getAttrOffsets().begin();
+    RELEASE_ASSERT(hcls->type == HiddenClass::NORMAL || hcls->type == HiddenClass::SINGLETON, "");
+    it = hcls->getStrAttrOffsets().begin();
 }
 
 Box* AttrWrapperIter::hasnext(Box* _self) {
     RELEASE_ASSERT(_self->cls == attrwrapperiter_cls, "");
     AttrWrapperIter* self = static_cast<AttrWrapperIter*>(_self);
-    RELEASE_ASSERT(self->hcls->type == HiddenClass::NORMAL, "");
+    RELEASE_ASSERT(self->hcls->type == HiddenClass::NORMAL || self->hcls->type == HiddenClass::SINGLETON, "");
 
-    return boxBool(self->it != self->hcls->getAttrOffsets().end());
+    return boxBool(self->it != self->hcls->getStrAttrOffsets().end());
 }
 
 Box* AttrWrapperIter::next(Box* _self) {
     RELEASE_ASSERT(_self->cls == attrwrapperiter_cls, "");
     AttrWrapperIter* self = static_cast<AttrWrapperIter*>(_self);
-    RELEASE_ASSERT(self->hcls->type == HiddenClass::NORMAL, "");
+    RELEASE_ASSERT(self->hcls->type == HiddenClass::NORMAL || self->hcls->type == HiddenClass::SINGLETON, "");
 
-    assert(self->it != self->hcls->getAttrOffsets().end());
+    assert(self->it != self->hcls->getStrAttrOffsets().end());
     Box* r = boxString(self->it->first());
     ++self->it;
     return r;
 }
 
-Box* makeAttrWrapper(Box* b) {
-    assert(b->cls->instancesHaveHCAttrs());
-    if (b->getHCAttrsPtr()->hcls->type == HiddenClass::DICT_BACKED) {
-        return b->getHCAttrsPtr()->attr_list->attrs[0];
+Box* Box::getAttrWrapper() {
+    assert(cls->instancesHaveHCAttrs());
+    HCAttrs* attrs = getHCAttrsPtr();
+    HiddenClass* hcls = attrs->hcls;
+
+    if (hcls->type == HiddenClass::DICT_BACKED) {
+        return attrs->attr_list->attrs[0];
     }
 
-    return new AttrWrapper(b);
+    int offset = hcls->getAttrwrapperOffset();
+    if (offset == -1) {
+        Box* aw = new AttrWrapper(this);
+        if (hcls->type == HiddenClass::NORMAL) {
+            auto new_hcls = hcls->getAttrwrapperChild();
+            appendNewHCAttr(aw, NULL);
+            attrs->hcls = new_hcls;
+            return aw;
+        } else {
+            assert(hcls->type == HiddenClass::SINGLETON);
+            appendNewHCAttr(aw, NULL);
+            hcls->appendAttrwrapper();
+            return aw;
+        }
+    }
+    return attrs->attr_list->attrs[offset];
 }
 
 Box* unwrapAttrWrapper(Box* b) {
@@ -1479,6 +1715,10 @@ Box* objectRepr(Box* obj) {
 
 Box* objectStr(Box* obj) {
     return obj->reprIC();
+}
+
+Box* objectHash(Box* obj) {
+    return boxInt(_Py_HashPointer(obj));
 }
 
 Box* objectSetattr(Box* obj, Box* attr, Box* value) {
@@ -1583,6 +1823,13 @@ static PyObject* reduce_2(PyObject* obj) noexcept {
             PyErr_Clear();
             state = Py_None;
             Py_INCREF(state);
+        } else {
+            // Pyston change: convert attrwrapper to a real dict
+            if (state->cls == attrwrapper_cls) {
+                PyObject* real_dict = PyDict_New();
+                PyDict_Update(real_dict, state);
+                state = real_dict;
+            }
         }
         names = slotnames(cls);
         if (names == NULL)
@@ -1849,6 +2096,8 @@ inline void initUserAttrs(Box* obj, BoxedClass* cls) {
     }
 }
 
+extern "C" void PyCallIter_AddHasNext();
+
 extern "C" PyObject* PyObject_Init(PyObject* op, PyTypeObject* tp) noexcept {
     assert(op);
     assert(tp);
@@ -1869,6 +2118,20 @@ extern "C" PyObject* PyObject_Init(PyObject* op, PyTypeObject* tp) noexcept {
     // TODO It does mean that anything not defering to this function will have to call
     // initUserAttrs themselves, though.
     initUserAttrs(op, tp);
+
+#ifndef NDEBUG
+    if (tp->tp_flags & Py_TPFLAGS_HEAPTYPE) {
+        BoxedHeapClass* heap_cls = static_cast<BoxedHeapClass*>(tp);
+        if (heap_cls->nslots() > 0) {
+            BoxedHeapClass::SlotOffset* slotOffsets = heap_cls->slotOffsets();
+            for (int i = 0; i < heap_cls->nslots(); i++) {
+                // This should be set to 0 on allocation:
+                // (If it wasn't, we would need to initialize it to 0 here.)
+                assert(*(Box**)((char*)op + slotOffsets[i]) == NULL);
+            }
+        }
+    }
+#endif
 
     return op;
 }
@@ -1899,18 +2162,20 @@ void setupRuntime() {
     type_cls = ::new (mem) BoxedHeapClass(object_cls, &typeGCHandler, offsetof(BoxedClass, attrs),
                                           offsetof(BoxedClass, tp_weaklist), sizeof(BoxedHeapClass), false, NULL);
     type_cls->tp_flags |= Py_TPFLAGS_TYPE_SUBCLASS;
+    type_cls->tp_itemsize = sizeof(BoxedHeapClass::SlotOffset);
     PyObject_Init(object_cls, type_cls);
     PyObject_Init(type_cls, type_cls);
 
-    none_cls = new BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(Box), false, NULL);
+    none_cls = new (0) BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(Box), false, NULL);
     None = new (none_cls) Box();
     assert(None->cls);
     gc::registerPermanentRoot(None);
 
     // You can't actually have an instance of basestring
-    basestring_cls = new BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(Box), false, NULL);
+    basestring_cls = new (0) BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(Box), false, NULL);
 
-    str_cls = new BoxedHeapClass(basestring_cls, NULL, 0, 0, sizeof(BoxedString), false, NULL);
+    // We add 1 to the tp_basicsize of the BoxedString in order to hold the null byte at the end.
+    str_cls = new (0) BoxedHeapClass(basestring_cls, NULL, 0, 0, sizeof(BoxedString) + 1, false, NULL);
     str_cls->tp_flags |= Py_TPFLAGS_STRING_SUBCLASS;
     str_cls->tp_itemsize = sizeof(char);
 
@@ -1939,58 +2204,63 @@ void setupRuntime() {
     object_cls->giveAttr("__base__", None);
 
 
-    tuple_cls
-        = new BoxedHeapClass(object_cls, &tupleGCHandler, 0, 0, sizeof(BoxedTuple), false, boxStrConstant("tuple"));
+    tuple_cls = new (0)
+        BoxedHeapClass(object_cls, &tupleGCHandler, 0, 0, sizeof(BoxedTuple), false, boxStrConstant("tuple"));
     tuple_cls->tp_flags |= Py_TPFLAGS_TUPLE_SUBCLASS;
     tuple_cls->tp_itemsize = sizeof(Box*);
     tuple_cls->tp_mro = BoxedTuple::create({ tuple_cls, object_cls });
     EmptyTuple = BoxedTuple::create({});
     gc::registerPermanentRoot(EmptyTuple);
-    list_cls = new BoxedHeapClass(object_cls, &listGCHandler, 0, 0, sizeof(BoxedList), false, boxStrConstant("list"));
+    list_cls = new (0)
+        BoxedHeapClass(object_cls, &listGCHandler, 0, 0, sizeof(BoxedList), false, boxStrConstant("list"));
     list_cls->tp_flags |= Py_TPFLAGS_LIST_SUBCLASS;
-    pyston_getset_cls
-        = new BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedGetsetDescriptor), false, boxStrConstant("getset"));
-    attrwrapper_cls = new BoxedHeapClass(object_cls, &AttrWrapper::gcHandler, 0, 0, sizeof(AttrWrapper), false,
-                                         static_cast<BoxedString*>(boxStrConstant("attrwrapper")));
-    dict_cls = new BoxedHeapClass(object_cls, &dictGCHandler, 0, 0, sizeof(BoxedDict), false,
-                                  static_cast<BoxedString*>(boxStrConstant("dict")));
+    pyston_getset_cls = new (0)
+        BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedGetsetDescriptor), false, boxStrConstant("getset"));
+    attrwrapper_cls = new (0) BoxedHeapClass(object_cls, &AttrWrapper::gcHandler, 0, 0, sizeof(AttrWrapper), false,
+                                             static_cast<BoxedString*>(boxStrConstant("attrwrapper")));
+    dict_cls = new (0) BoxedHeapClass(object_cls, &dictGCHandler, 0, 0, sizeof(BoxedDict), false,
+                                      static_cast<BoxedString*>(boxStrConstant("dict")));
     dict_cls->tp_flags |= Py_TPFLAGS_DICT_SUBCLASS;
-    file_cls = new BoxedHeapClass(object_cls, &BoxedFile::gcHandler, 0, offsetof(BoxedFile, weakreflist),
-                                  sizeof(BoxedFile), false, static_cast<BoxedString*>(boxStrConstant("file")));
-    int_cls = new BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedInt), false,
-                                 static_cast<BoxedString*>(boxStrConstant("int")));
+    file_cls = new (0) BoxedHeapClass(object_cls, &BoxedFile::gcHandler, 0, offsetof(BoxedFile, weakreflist),
+                                      sizeof(BoxedFile), false, static_cast<BoxedString*>(boxStrConstant("file")));
+    int_cls = new (0) BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedInt), false,
+                                     static_cast<BoxedString*>(boxStrConstant("int")));
     int_cls->tp_flags |= Py_TPFLAGS_INT_SUBCLASS;
-    bool_cls = new BoxedHeapClass(int_cls, NULL, 0, 0, sizeof(BoxedBool), false,
-                                  static_cast<BoxedString*>(boxStrConstant("bool")));
-    complex_cls = new BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedComplex), false,
-                                     static_cast<BoxedString*>(boxStrConstant("complex")));
-    long_cls = new BoxedHeapClass(object_cls, &BoxedLong::gchandler, 0, 0, sizeof(BoxedLong), false,
-                                  static_cast<BoxedString*>(boxStrConstant("long")));
+    bool_cls = new (0) BoxedHeapClass(int_cls, NULL, 0, 0, sizeof(BoxedBool), false,
+                                      static_cast<BoxedString*>(boxStrConstant("bool")));
+    complex_cls = new (0) BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedComplex), false,
+                                         static_cast<BoxedString*>(boxStrConstant("complex")));
+    long_cls = new (0) BoxedHeapClass(object_cls, &BoxedLong::gchandler, 0, 0, sizeof(BoxedLong), false,
+                                      static_cast<BoxedString*>(boxStrConstant("long")));
     long_cls->tp_flags |= Py_TPFLAGS_LONG_SUBCLASS;
-    float_cls = new BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedFloat), false,
-                                   static_cast<BoxedString*>(boxStrConstant("float")));
-    function_cls = new BoxedHeapClass(object_cls, &functionGCHandler, offsetof(BoxedFunction, attrs),
-                                      offsetof(BoxedFunction, in_weakreflist), sizeof(BoxedFunction), false,
-                                      static_cast<BoxedString*>(boxStrConstant("function")));
-    builtin_function_or_method_cls
-        = new BoxedHeapClass(object_cls, &functionGCHandler, 0, offsetof(BoxedBuiltinFunctionOrMethod, in_weakreflist),
-                             sizeof(BoxedBuiltinFunctionOrMethod), false,
-                             static_cast<BoxedString*>(boxStrConstant("builtin_function_or_method")));
+    float_cls = new (0) BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedFloat), false,
+                                       static_cast<BoxedString*>(boxStrConstant("float")));
+    function_cls = new (0) BoxedHeapClass(object_cls, &functionGCHandler, offsetof(BoxedFunction, attrs),
+                                          offsetof(BoxedFunction, in_weakreflist), sizeof(BoxedFunction), false,
+                                          static_cast<BoxedString*>(boxStrConstant("function")));
+    builtin_function_or_method_cls = new (0)
+        BoxedHeapClass(object_cls, &functionGCHandler, 0, offsetof(BoxedBuiltinFunctionOrMethod, in_weakreflist),
+                       sizeof(BoxedBuiltinFunctionOrMethod), false,
+                       static_cast<BoxedString*>(boxStrConstant("builtin_function_or_method")));
     function_cls->simple_destructor = builtin_function_or_method_cls->simple_destructor = functionDtor;
 
 
-    module_cls = new BoxedHeapClass(object_cls, &moduleGCHandler, offsetof(BoxedModule, attrs), 0, sizeof(BoxedModule),
-                                    false, static_cast<BoxedString*>(boxStrConstant("module")));
-    member_cls = new BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedMemberDescriptor), false,
-                                    static_cast<BoxedString*>(boxStrConstant("member")));
-    capifunc_cls = new BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedCApiFunction), false,
-                                      static_cast<BoxedString*>(boxStrConstant("capifunc")));
-    method_cls = new BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedMethodDescriptor), false,
-                                    static_cast<BoxedString*>(boxStrConstant("method")));
-    wrapperobject_cls = new BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedWrapperObject), false,
-                                           static_cast<BoxedString*>(boxStrConstant("method-wrapper")));
-    wrapperdescr_cls = new BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedWrapperDescriptor), false,
-                                          static_cast<BoxedString*>(boxStrConstant("wrapper_descriptor")));
+    module_cls = new (0)
+        BoxedHeapClass(object_cls, &moduleGCHandler, offsetof(BoxedModule, attrs), 0, sizeof(BoxedModule), false,
+                       static_cast<BoxedString*>(boxStrConstant("module")));
+    member_descriptor_cls = new (0) BoxedHeapClass(object_cls, NULL, 0, 0, sizeof(BoxedMemberDescriptor), false,
+                                                   static_cast<BoxedString*>(boxStrConstant("member_descriptor")));
+    capifunc_cls = new (0) BoxedHeapClass(object_cls, BoxedCApiFunction::gcHandler, 0, 0, sizeof(BoxedCApiFunction),
+                                          false, static_cast<BoxedString*>(boxStrConstant("capifunc")));
+    method_cls = new (0)
+        BoxedHeapClass(object_cls, BoxedMethodDescriptor::gcHandler, 0, 0, sizeof(BoxedMethodDescriptor), false,
+                       static_cast<BoxedString*>(boxStrConstant("method")));
+    wrapperobject_cls = new (0)
+        BoxedHeapClass(object_cls, BoxedWrapperObject::gcHandler, 0, 0, sizeof(BoxedWrapperObject), false,
+                       static_cast<BoxedString*>(boxStrConstant("method-wrapper")));
+    wrapperdescr_cls = new (0)
+        BoxedHeapClass(object_cls, BoxedWrapperDescriptor::gcHandler, 0, 0, sizeof(BoxedWrapperDescriptor), false,
+                       static_cast<BoxedString*>(boxStrConstant("wrapper_descriptor")));
 
     EmptyString = boxStrConstant("");
     gc::registerPermanentRoot(EmptyString);
@@ -2012,7 +2282,7 @@ void setupRuntime() {
     float_cls->tp_mro = BoxedTuple::create({ float_cls, object_cls });
     function_cls->tp_mro = BoxedTuple::create({ function_cls, object_cls });
     builtin_function_or_method_cls->tp_mro = BoxedTuple::create({ builtin_function_or_method_cls, object_cls });
-    member_cls->tp_mro = BoxedTuple::create({ member_cls, object_cls });
+    member_descriptor_cls->tp_mro = BoxedTuple::create({ member_descriptor_cls, object_cls });
     capifunc_cls->tp_mro = BoxedTuple::create({ capifunc_cls, object_cls });
     module_cls->tp_mro = BoxedTuple::create({ module_cls, object_cls });
     method_cls->tp_mro = BoxedTuple::create({ method_cls, object_cls });
@@ -2067,7 +2337,7 @@ void setupRuntime() {
     float_cls->finishInitialization();
     function_cls->finishInitialization();
     builtin_function_or_method_cls->finishInitialization();
-    member_cls->finishInitialization();
+    member_descriptor_cls->finishInitialization();
     module_cls->finishInitialization();
     capifunc_cls->finishInitialization();
     method_cls->finishInitialization();
@@ -2115,9 +2385,12 @@ void setupRuntime() {
     object_cls->giveAttr("__init__", new BoxedFunction(boxRTFunction((void*)objectInit, UNKNOWN, 1, 0, true, false)));
     object_cls->giveAttr("__repr__", new BoxedFunction(boxRTFunction((void*)objectRepr, UNKNOWN, 1, 0, false, false)));
     object_cls->giveAttr("__str__", new BoxedFunction(boxRTFunction((void*)objectStr, UNKNOWN, 1, 0, false, false)));
-    object_cls->giveAttr(
-        "__subclasshook__",
-        boxInstanceMethod(object_cls, new BoxedFunction(boxRTFunction((void*)objectSubclasshook, UNKNOWN, 2))));
+    object_cls->giveAttr("__hash__",
+                         new BoxedFunction(boxRTFunction((void*)objectHash, BOXED_INT, 1, 0, false, false)));
+    object_cls->giveAttr("__subclasshook__",
+                         boxInstanceMethod(object_cls,
+                                           new BoxedFunction(boxRTFunction((void*)objectSubclasshook, UNKNOWN, 2)),
+                                           object_cls));
     // __setattr__ was already set to a WrapperDescriptor; it'd be nice to set this to a faster BoxedFunction
     // object_cls->setattr("__setattr__", new BoxedFunction(boxRTFunction((void*)objectSetattr, UNKNOWN, 3)), NULL);
     // but unfortunately that will set tp_setattro to slot_tp_setattro on object_cls and all already-made subclasses!
@@ -2146,8 +2419,8 @@ void setupRuntime() {
     none_cls->giveAttr("__nonzero__", new BoxedFunction(boxRTFunction((void*)noneNonzero, BOXED_BOOL, 1)));
     none_cls->freeze();
 
-    module_cls->giveAttr("__new__",
-                         new BoxedFunction(boxRTFunction((void*)moduleNew, UNKNOWN, 3, 1, false, false), { NULL }));
+    module_cls->giveAttr("__init__",
+                         new BoxedFunction(boxRTFunction((void*)moduleInit, UNKNOWN, 3, 1, false, false), { NULL }));
     module_cls->giveAttr("__repr__", new BoxedFunction(boxRTFunction((void*)moduleRepr, STR, 1)));
     module_cls->giveAttr("__dict__", dict_descr);
     module_cls->freeze();
@@ -2190,13 +2463,18 @@ void setupRuntime() {
                                                                    offsetof(BoxedFunction, modname), false));
     function_cls->giveAttr(
         "__doc__", new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedFunction, doc), false));
+    function_cls->giveAttr("__globals__", new (pyston_getset_cls) BoxedGetsetDescriptor(functionGlobals, NULL, NULL));
     function_cls->giveAttr("__get__", new BoxedFunction(boxRTFunction((void*)functionGet, UNKNOWN, 3)));
     function_cls->giveAttr("__call__",
                            new BoxedFunction(boxRTFunction((void*)functionCall, UNKNOWN, 1, 0, true, true)));
     function_cls->giveAttr("__nonzero__", new BoxedFunction(boxRTFunction((void*)functionNonzero, BOXED_BOOL, 1)));
     function_cls->giveAttr("func_code", new (pyston_getset_cls) BoxedGetsetDescriptor(functionCode, NULL, NULL));
+    function_cls->giveAttr("__code__", function_cls->getattr("func_code"));
+    function_cls->giveAttr("func_name", function_cls->getattr("__name__"));
     function_cls->giveAttr("func_defaults",
-                           new (pyston_getset_cls) BoxedGetsetDescriptor(functionDefaults, NULL, NULL));
+                           new (pyston_getset_cls) BoxedGetsetDescriptor(functionDefaults, functionSetDefaults, NULL));
+    function_cls->giveAttr("__defaults__", function_cls->getattr("func_defaults"));
+    function_cls->giveAttr("func_globals", function_cls->getattr("__globals__"));
     function_cls->freeze();
 
     builtin_function_or_method_cls->giveAttr(
@@ -2221,9 +2499,14 @@ void setupRuntime() {
         "__call__", new BoxedFunction(boxRTFunction((void*)instancemethodCall, UNKNOWN, 1, 0, true, true)));
     instancemethod_cls->giveAttr(
         "im_func", new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedInstanceMethod, func)));
+    instancemethod_cls->giveAttr("__func__", instancemethod_cls->getattr("im_func"));
     instancemethod_cls->giveAttr(
         "im_self", new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedInstanceMethod, obj)));
+    instancemethod_cls->giveAttr("__self__", instancemethod_cls->getattr("im_self"));
     instancemethod_cls->freeze();
+
+    instancemethod_cls->giveAttr("im_class", new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT,
+                                                                       offsetof(BoxedInstanceMethod, im_class), true));
 
     slice_cls->giveAttr("__new__",
                         new BoxedFunction(boxRTFunction((void*)sliceNew, UNKNOWN, 4, 2, false, false), { NULL, None }));
@@ -2248,14 +2531,15 @@ void setupRuntime() {
     attrwrapper_cls->giveAttr("keys", new BoxedFunction(boxRTFunction((void*)AttrWrapper::keys, LIST, 1)));
     attrwrapper_cls->giveAttr("values", new BoxedFunction(boxRTFunction((void*)AttrWrapper::values, LIST, 1)));
     attrwrapper_cls->giveAttr("items", new BoxedFunction(boxRTFunction((void*)AttrWrapper::items, LIST, 1)));
-    // TODO: not quite right
-    attrwrapper_cls->giveAttr("iterkeys", attrwrapper_cls->getattr("keys"));
-    attrwrapper_cls->giveAttr("itervalues", attrwrapper_cls->getattr("values"));
-    attrwrapper_cls->giveAttr("iteritems", attrwrapper_cls->getattr("items"));
+    attrwrapper_cls->giveAttr("iterkeys", new BoxedFunction(boxRTFunction((void*)AttrWrapper::iterkeys, UNKNOWN, 1)));
+    attrwrapper_cls->giveAttr("itervalues",
+                              new BoxedFunction(boxRTFunction((void*)AttrWrapper::itervalues, UNKNOWN, 1)));
+    attrwrapper_cls->giveAttr("iteritems", new BoxedFunction(boxRTFunction((void*)AttrWrapper::iteritems, UNKNOWN, 1)));
     attrwrapper_cls->giveAttr("copy", new BoxedFunction(boxRTFunction((void*)AttrWrapper::copy, UNKNOWN, 1)));
     attrwrapper_cls->giveAttr("__len__", new BoxedFunction(boxRTFunction((void*)AttrWrapper::len, BOXED_INT, 1)));
     attrwrapper_cls->giveAttr("__iter__", new BoxedFunction(boxRTFunction((void*)AttrWrapper::iter, UNKNOWN, 1)));
-    attrwrapper_cls->giveAttr("update", new BoxedFunction(boxRTFunction((void*)AttrWrapper::update, NONE, 2)));
+    attrwrapper_cls->giveAttr("update",
+                              new BoxedFunction(boxRTFunction((void*)AttrWrapper::update, NONE, 1, 0, true, true)));
     attrwrapper_cls->freeze();
 
     attrwrapperiter_cls->giveAttr("__hasnext__",
@@ -2269,9 +2553,11 @@ void setupRuntime() {
     setupGC();
     setupImport();
     setupPyston();
+    setupAST();
 
     PyType_Ready(&PyByteArrayIter_Type);
     PyType_Ready(&PyCapsule_Type);
+    PyCallIter_AddHasNext();
     PyType_Ready(&PyCallIter_Type);
     PyType_Ready(&PyCObject_Type);
 
@@ -2309,6 +2595,7 @@ void setupRuntime() {
     init_ssl();
     init_sqlite3();
     PyMarshal_Init();
+    initstrop();
 
     // some additional setup to ensure weakrefs participate in our GC
     BoxedClass* weakref_ref_cls = &_PyWeakref_RefType;
@@ -2337,28 +2624,28 @@ void setupRuntime() {
 
     setupSysEnd();
 
-    Stats::endOfInit();
-
     TRACK_ALLOCATIONS = true;
 }
 
-BoxedModule* createModule(const std::string& name, const std::string& fn, const char* doc) {
-    assert(fn.size() && "probably wanted to set the fn to <stdin>?");
+BoxedModule* createModule(const std::string& name, const char* fn, const char* doc) {
+    assert((!fn || strlen(fn)) && "probably wanted to set the fn to <stdin>?");
 
     BoxedDict* d = getSysModulesDict();
     Box* b_name = boxStringPtr(&name);
 
     // Surprisingly, there are times that we need to return the existing module if
     // one exists:
-    Box*& ptr = d->d[b_name];
-    if (ptr && isSubclass(ptr->cls, module_cls)) {
-        return static_cast<BoxedModule*>(ptr);
-    } else {
-        ptr = NULL;
+    Box* existing = d->getOrNull(b_name);
+    if (existing && isSubclass(existing->cls, module_cls)) {
+        return static_cast<BoxedModule*>(existing);
     }
 
-    BoxedModule* module = new BoxedModule(name, fn, doc);
-    ptr = module;
+    BoxedModule* module = new BoxedModule();
+    moduleInit(module, boxString(name), boxString(doc ? doc : ""));
+    if (fn)
+        module->giveAttr("__file__", boxString(fn));
+
+    d->d[b_name] = module;
     return module;
 }
 

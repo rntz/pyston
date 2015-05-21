@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <cfloat>
 #include <cstddef>
 #include <err.h>
 
@@ -81,7 +82,7 @@ extern "C" Box* vars(Box* obj) {
     if (!obj)
         return fastLocalsToBoxedLocals();
 
-    return makeAttrWrapper(obj);
+    return obj->getAttrWrapper();
 }
 
 extern "C" Box* abs_(Box* x) {
@@ -303,6 +304,7 @@ extern "C" Box* ord(Box* obj) {
 }
 
 Box* range(Box* start, Box* stop, Box* step) {
+    STAT_TIMER(t0, "us_timer_builtin_range");
     i64 istart, istop, istep;
     if (stop == NULL) {
         istart = 0;
@@ -346,6 +348,7 @@ Box* notimplementedRepr(Box* self) {
 }
 
 Box* sorted(Box* obj, Box* cmp, Box* key, Box** args) {
+    STAT_TIMER(t0, "us_timer_builtin_sorted");
     Box* reverse = args[0];
 
     BoxedList* rtn = new BoxedList();
@@ -358,6 +361,7 @@ Box* sorted(Box* obj, Box* cmp, Box* key, Box** args) {
 }
 
 Box* isinstance_func(Box* obj, Box* cls) {
+    STAT_TIMER(t0, "us_timer_builtin_isinstance");
     int rtn = PyObject_IsInstance(obj, cls);
     if (rtn < 0)
         checkAndThrowCAPIException();
@@ -365,15 +369,28 @@ Box* isinstance_func(Box* obj, Box* cls) {
 }
 
 Box* issubclass_func(Box* child, Box* parent) {
+    STAT_TIMER(t0, "us_timer_builtin_issubclass");
     int rtn = PyObject_IsSubclass(child, parent);
     if (rtn < 0)
         checkAndThrowCAPIException();
     return boxBool(rtn);
 }
 
+Box* intern_func(Box* str) {
+    if (!PyString_CheckExact(str)) // have to use exact check!
+        raiseExcHelper(TypeError, "can't intern subclass of string");
+    PyString_InternInPlace(&str);
+    checkAndThrowCAPIException();
+    return str;
+}
+
 Box* bltinImport(Box* name, Box* globals, Box* locals, Box** args) {
     Box* fromlist = args[0];
     Box* level = args[1];
+
+    // __import__ takes a 'locals' argument, but it doesn't get used in CPython.
+    // Well, it gets passed to PyImport_ImportModuleLevel() and then import_module_level(),
+    // which ignores it.  So we don't even pass it through.
 
     name = coerceUnicodeToStr(name);
 
@@ -461,8 +478,14 @@ Box* hasattr(Box* obj, Box* _str) {
 
 Box* map2(Box* f, Box* container) {
     Box* rtn = new BoxedList();
+    bool use_identity_func = f == None;
     for (Box* e : container->pyElements()) {
-        listAppendInternal(rtn, runtimeCall(f, ArgPassSpec(1), e, NULL, NULL, NULL, NULL));
+        Box* val;
+        if (use_identity_func)
+            val = e;
+        else
+            val = runtimeCall(f, ArgPassSpec(1), e, NULL, NULL, NULL, NULL);
+        listAppendInternal(rtn, val);
     }
     return rtn;
 }
@@ -477,8 +500,8 @@ Box* map(Box* f, BoxedTuple* args) {
     if (num_iterable == 1)
         return map2(f, args->elts[0]);
 
-    std::vector<BoxIterator> args_it;
-    std::vector<BoxIterator> args_end;
+    std::vector<BoxIterator, StlCompatAllocator<BoxIterator>> args_it;
+    std::vector<BoxIterator, StlCompatAllocator<BoxIterator>> args_end;
 
     for (auto e : *args) {
         auto range = e->pyElements();
@@ -488,6 +511,7 @@ Box* map(Box* f, BoxedTuple* args) {
     assert(args_it.size() == num_iterable);
     assert(args_end.size() == num_iterable);
 
+    bool use_identity_func = f == None;
     Box* rtn = new BoxedList();
     std::vector<Box*, StlCompatAllocator<Box*>> current_val(num_iterable);
     while (true) {
@@ -504,9 +528,14 @@ Box* map(Box* f, BoxedTuple* args) {
         if (num_done == num_iterable)
             break;
 
-        auto v = getTupleFromArgsArray(&current_val[0], num_iterable);
-        listAppendInternal(rtn, runtimeCall(f, ArgPassSpec(num_iterable), std::get<0>(v), std::get<1>(v),
-                                            std::get<2>(v), std::get<3>(v), NULL));
+        Box* entry;
+        if (!use_identity_func) {
+            auto v = getTupleFromArgsArray(&current_val[0], num_iterable);
+            entry = runtimeCall(f, ArgPassSpec(num_iterable), std::get<0>(v), std::get<1>(v), std::get<2>(v),
+                                std::get<3>(v), NULL);
+        } else
+            entry = BoxedTuple::create(num_iterable, &current_val[0]);
+        listAppendInternal(rtn, entry);
 
         for (int i = 0; i < num_iterable; ++i) {
             if (args_it[i] != args_end[i])
@@ -554,19 +583,36 @@ Box* filter2(Box* f, Box* container) {
     return rtn;
 }
 
-Box* zip2(Box* container1, Box* container2) {
+Box* zip(BoxedTuple* containers) {
+    assert(containers->cls == tuple_cls);
+
     BoxedList* rtn = new BoxedList();
+    if (containers->size() == 0)
+        return rtn;
 
-    llvm::iterator_range<BoxIterator> range1 = container1->pyElements();
-    llvm::iterator_range<BoxIterator> range2 = container2->pyElements();
-
-    BoxIterator it1 = range1.begin();
-    BoxIterator it2 = range2.begin();
-
-    for (; it1 != range1.end() && it2 != range2.end(); ++it1, ++it2) {
-        listAppendInternal(rtn, BoxedTuple::create({ *it1, *it2 }));
+    std::vector<llvm::iterator_range<BoxIterator>, StlCompatAllocator<llvm::iterator_range<BoxIterator>>> ranges;
+    for (auto container : *containers) {
+        ranges.push_back(container->pyElements());
     }
-    return rtn;
+
+    std::vector<BoxIterator, StlCompatAllocator<BoxIterator>> iterators;
+    for (auto range : ranges) {
+        iterators.push_back(range.begin());
+    }
+
+    while (true) {
+        for (int i = 0; i < iterators.size(); i++) {
+            if (iterators[i] == ranges[i].end())
+                return rtn;
+        }
+
+        auto el = BoxedTuple::create(iterators.size());
+        for (int i = 0; i < iterators.size(); i++) {
+            el->elts[i] = *iterators[i];
+            ++(iterators[i]);
+        }
+        listAppendInternal(rtn, el);
+    }
 }
 
 static Box* callable(Box* obj) {
@@ -586,8 +632,7 @@ public:
     static Box* __reduce__(Box* self) {
         RELEASE_ASSERT(isSubclass(self->cls, BaseException), "");
         BoxedException* exc = static_cast<BoxedException*>(self);
-
-        return BoxedTuple::create({ self->cls, EmptyTuple, makeAttrWrapper(self) });
+        return BoxedTuple::create({ self->cls, EmptyTuple, self->getAttrWrapper() });
     }
 };
 
@@ -746,8 +791,27 @@ extern "C" PyObject* PyEval_GetLocals(void) noexcept {
     }
 }
 
+extern "C" PyObject* PyEval_GetGlobals(void) noexcept {
+    try {
+        return globals();
+    } catch (ExcInfo e) {
+        setCAPIException(e);
+        return NULL;
+    }
+}
+
+extern "C" PyObject* PyEval_GetBuiltins(void) noexcept {
+    return builtins_module;
+}
+
 Box* divmod(Box* lhs, Box* rhs) {
     return binopInternal(lhs, rhs, AST_TYPE::DivMod, false, NULL);
+}
+
+Box* powFunc(Box* x, Box* y, Box* z) {
+    Box* rtn = PyNumber_Power(x, y, z);
+    checkAndThrowCAPIException();
+    return rtn;
 }
 
 Box* execfile(Box* _fn) {
@@ -949,25 +1013,68 @@ Box* rawInput(Box* prompt) {
 }
 
 Box* input(Box* prompt) {
-    fatalOrError(PyExc_NotImplementedError, "unimplemented");
-    throwCAPIException();
+    char* str;
+
+    PyObject* line = raw_input(prompt);
+    if (line == NULL)
+        throwCAPIException();
+
+    if (!PyArg_Parse(line, "s;embedded '\\0' in input line", &str))
+        throwCAPIException();
+
+    // CPython trims the string first, but our eval function takes care of that.
+    // while (*str == ' ' || *str == '\t')
+    //    str++;
+
+    Box* gbls = globals();
+    Box* lcls = locals();
+
+    // CPython has these safety checks that the builtin functions exist
+    // in the current global scope.
+    // e.g. eval('input()', {})
+    if (PyDict_GetItemString(gbls, "__builtins__") == NULL) {
+        if (PyDict_SetItemString(gbls, "__builtins__", builtins_module) != 0)
+            throwCAPIException();
+    }
+
+    return eval(line, gbls, lcls);
 }
 
 Box* builtinRound(Box* _number, Box* _ndigits) {
-    if (!isSubclass(_number->cls, float_cls))
+    double x = PyFloat_AsDouble(_number);
+    if (PyErr_Occurred())
         raiseExcHelper(TypeError, "a float is required");
 
-    BoxedFloat* number = (BoxedFloat*)_number;
+    /* interpret 2nd argument as a Py_ssize_t; clip on overflow */
+    Py_ssize_t ndigits = PyNumber_AsSsize_t(_ndigits, NULL);
+    if (ndigits == -1 && PyErr_Occurred())
+        throwCAPIException();
 
-    if (isSubclass(_ndigits->cls, int_cls)) {
-        BoxedInt* ndigits = (BoxedInt*)_ndigits;
+    /* nans, infinities and zeros round to themselves */
+    if (!std::isfinite(x) || x == 0.0)
+        return boxFloat(x);
 
-        if (ndigits->n == 0)
-            return boxFloat(round(number->d));
+/* Deal with extreme values for ndigits. For ndigits > NDIGITS_MAX, x
+   always rounds to itself.  For ndigits < NDIGITS_MIN, x always
+   rounds to +-0.0.  Here 0.30103 is an upper bound for log10(2). */
+#define NDIGITS_MAX ((int)((DBL_MANT_DIG - DBL_MIN_EXP) * 0.30103))
+#define NDIGITS_MIN (-(int)((DBL_MAX_EXP + 1) * 0.30103))
+    if (ndigits > NDIGITS_MAX)
+        /* return x */
+        return boxFloat(x);
+    else if (ndigits < NDIGITS_MIN)
+        /* return 0.0, but with sign of x */
+        return boxFloat(0.0 * x);
+    else {
+        /* finite x, and ndigits is not unreasonably large */
+        /* _Py_double_round is defined in floatobject.c */
+        Box* rtn = _Py_double_round(x, (int)ndigits);
+        if (!rtn)
+            throwCAPIException();
+        return rtn;
     }
-
-    fatalOrError(PyExc_NotImplementedError, "unimplemented");
-    throwCAPIException();
+#undef NDIGITS_MAX
+#undef NDIGITS_MIN
 }
 
 Box* builtinCmp(Box* a, Box* b) {
@@ -990,9 +1097,9 @@ Box* builtinApply(Box* func, Box* args, Box* keywords) {
 }
 
 void setupBuiltins() {
-    builtins_module = createModule("__builtin__", "__builtin__",
-                                   "Built-in functions, exceptions, and other objects.\n\nNoteworthy: None is "
-                                   "the `nil' object; Ellipsis represents `...' in slices.");
+    builtins_module
+        = createModule("__builtin__", NULL, "Built-in functions, exceptions, and other objects.\n\nNoteworthy: None is "
+                                            "the `nil' object; Ellipsis represents `...' in slices.");
 
     BoxedHeapClass* ellipsis_cls
         = BoxedHeapClass::create(type_cls, object_cls, NULL, 0, 0, sizeof(Box), false, "ellipsis");
@@ -1083,6 +1190,8 @@ void setupBuiltins() {
     Box* hasattr_obj = new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)hasattr, BOXED_BOOL, 2), "hasattr");
     builtins_module->giveAttr("hasattr", hasattr_obj);
 
+    builtins_module->giveAttr("pow", new BoxedBuiltinFunctionOrMethod(
+                                         boxRTFunction((void*)powFunc, UNKNOWN, 3, 1, false, false), "pow", { None }));
 
     Box* isinstance_obj
         = new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)isinstance_func, BOXED_BOOL, 2), "isinstance");
@@ -1091,6 +1200,9 @@ void setupBuiltins() {
     Box* issubclass_obj
         = new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)issubclass_func, BOXED_BOOL, 2), "issubclass");
     builtins_module->giveAttr("issubclass", issubclass_obj);
+
+    Box* intern_obj = new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)intern_func, UNKNOWN, 1), "intern");
+    builtins_module->giveAttr("intern", intern_obj);
 
     CLFunction* import_func = boxRTFunction((void*)bltinImport, UNKNOWN, 5, 4, false, false,
                                             ParamNames({ "name", "globals", "locals", "fromlist", "level" }, "", ""));
@@ -1163,7 +1275,8 @@ void setupBuiltins() {
                                                    { NULL }));
     builtins_module->giveAttr("filter",
                               new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)filter2, LIST, 2), "filter"));
-    builtins_module->giveAttr("zip", new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)zip2, LIST, 2), "zip"));
+    builtins_module->giveAttr(
+        "zip", new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)zip, LIST, 0, 0, true, false), "zip"));
     builtins_module->giveAttr(
         "dir", new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)dir, LIST, 1, 1, false, false), "dir", { NULL }));
     builtins_module->giveAttr("vars", new BoxedBuiltinFunctionOrMethod(
@@ -1204,8 +1317,9 @@ void setupBuiltins() {
     PyType_Ready(&PyBuffer_Type);
     builtins_module->giveAttr("buffer", &PyBuffer_Type);
 
-    builtins_module->giveAttr(
-        "eval", new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)eval, UNKNOWN, 1, 0, false, false), "eval"));
+    builtins_module->giveAttr("eval",
+                              new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)eval, UNKNOWN, 3, 2, false, false),
+                                                               "eval", { NULL, NULL }));
     builtins_module->giveAttr("callable",
                               new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)callable, UNKNOWN, 1), "callable"));
 

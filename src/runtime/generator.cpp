@@ -86,28 +86,36 @@ Context* getReturnContextForGeneratorFrame(void* frame_addr) {
 }
 
 void generatorEntry(BoxedGenerator* g) {
-    assert(g->cls == generator_cls);
-    assert(g->function->cls == function_cls);
+    {
+        STAT_TIMER2(t0, "us_timer_generator_toplevel", g->timer_time);
 
-    threading::pushGenerator(g, g->stack_begin, g->returnContext);
+        assert(g->cls == generator_cls);
+        assert(g->function->cls == function_cls);
 
-    try {
-        RegisterHelper context_registerer(g, __builtin_frame_address(0));
+        threading::pushGenerator(g, g->stack_begin, g->returnContext);
+        try {
+            RegisterHelper context_registerer(g, __builtin_frame_address(0));
 
-        // call body of the generator
-        BoxedFunctionBase* func = g->function;
+            // call body of the generator
+            BoxedFunctionBase* func = g->function;
 
-        Box** args = g->args ? &g->args->elts[0] : nullptr;
-        callCLFunc(func->f, nullptr, func->f->numReceivedArgs(), func->closure, g, func->globals, g->arg1, g->arg2,
-                   g->arg3, args);
-    } catch (ExcInfo e) {
-        // unhandled exception: propagate the exception to the caller
-        g->exception = e;
+            Box** args = g->args ? &g->args->elts[0] : nullptr;
+            callCLFunc(func->f, nullptr, func->f->numReceivedArgs(), func->closure, g, func->globals, g->arg1, g->arg2,
+                       g->arg3, args);
+        } catch (ExcInfo e) {
+            // unhandled exception: propagate the exception to the caller
+            g->exception = e;
+        }
+
+        // we returned from the body of the generator. next/send/throw will notify the caller
+        g->entryExited = true;
+        threading::popGenerator();
+
+#if STAT_TIMERS
+        g->timer_time = getCPUTicks(); // store off the timer that our caller (in g->returnContext) will resume at
+        STAT_TIMER_NAME(t0).pause(g->timer_time);
+#endif
     }
-
-    // we returned from the body of the generator. next/send/throw will notify the caller
-    g->entryExited = true;
-    threading::popGenerator();
     swapContext(&g->context, g->returnContext, 0);
 }
 
@@ -115,22 +123,34 @@ Box* generatorIter(Box* s) {
     return s;
 }
 
-Box* generatorSend(Box* s, Box* v) {
-    assert(s->cls == generator_cls);
-    BoxedGenerator* self = static_cast<BoxedGenerator*>(s);
-
+// called from both generatorHasNext and generatorSend/generatorNext (but only if generatorHasNext hasn't been called)
+static void generatorSendInternal(BoxedGenerator* self, Box* v) {
     if (self->running)
         raiseExcHelper(ValueError, "generator already executing");
 
     // check if the generator already exited
     if (self->entryExited) {
         freeGeneratorStack(self);
-        raiseExcHelper(StopIteration, "");
+        return;
     }
 
     self->returnValue = v;
     self->running = true;
+
+#if STAT_TIMERS
+    // store off the time that the generator will use to initialize its toplevel timer
+    self->timer_time = getCPUTicks();
+    StatTimer* current_timers = StatTimer::swapStack(self->statTimers, self->timer_time);
+#endif
+
     swapContext(&self->returnContext, self->context, (intptr_t)self);
+
+#if STAT_TIMERS
+    // if the generator exited we use the time that generatorEntry stored in self->timer_time (the same time it paused
+    // its timer at).
+    self->statTimers = StatTimer::swapStack(current_timers, self->entryExited ? self->timer_time : getCPUTicks());
+#endif
+
     self->running = false;
 
     // propagate exception to the caller
@@ -139,9 +159,23 @@ Box* generatorSend(Box* s, Box* v) {
         raiseRaw(self->exception);
     }
 
-    // throw StopIteration if the generator exited
     if (self->entryExited) {
         freeGeneratorStack(self);
+        return;
+    }
+}
+
+Box* generatorSend(Box* s, Box* v) {
+    assert(s->cls == generator_cls);
+    BoxedGenerator* self = static_cast<BoxedGenerator*>(s);
+
+    if (self->iterated_from__hasnext__)
+        Py_FatalError(".throw called on generator last advanced with __hasnext__");
+
+    generatorSendInternal(self, v);
+
+    // throw StopIteration if the generator exited
+    if (self->entryExited) {
         raiseExcHelper(StopIteration, "");
     }
 
@@ -151,6 +185,10 @@ Box* generatorSend(Box* s, Box* v) {
 Box* generatorThrow(Box* s, BoxedClass* exc_cls, Box* exc_val = nullptr, Box** args = nullptr) {
     assert(s->cls == generator_cls);
     BoxedGenerator* self = static_cast<BoxedGenerator*>(s);
+
+    if (self->iterated_from__hasnext__)
+        Py_FatalError(".throw called on generator last advanced with __hasnext__");
+
     Box* exc_tb = args ? nullptr : args[0];
     if (!exc_val)
         exc_val = None;
@@ -172,8 +210,33 @@ Box* generatorClose(Box* s) {
 }
 
 Box* generatorNext(Box* s) {
+    assert(s->cls == generator_cls);
+    BoxedGenerator* self = static_cast<BoxedGenerator*>(s);
+
+    if (self->iterated_from__hasnext__) {
+        self->iterated_from__hasnext__ = false;
+        return self->returnValue;
+    }
+
     return generatorSend(s, None);
 }
+
+i1 generatorHasnextUnboxed(Box* s) {
+    assert(s->cls == generator_cls);
+    BoxedGenerator* self = static_cast<BoxedGenerator*>(s);
+
+    if (!self->iterated_from__hasnext__) {
+        generatorSendInternal(self, None);
+        self->iterated_from__hasnext__ = true;
+    }
+
+    return !self->entryExited;
+}
+
+Box* generatorHasnext(Box* s) {
+    return boxBool(generatorHasnextUnboxed(s));
+}
+
 
 extern "C" Box* yield(BoxedGenerator* obj, Box* value) {
     assert(obj->cls == generator_cls);
@@ -202,8 +265,17 @@ extern "C" BoxedGenerator* createGenerator(BoxedFunctionBase* function, Box* arg
 
 
 extern "C" BoxedGenerator::BoxedGenerator(BoxedFunctionBase* function, Box* arg1, Box* arg2, Box* arg3, Box** args)
-    : function(function), arg1(arg1), arg2(arg2), arg3(arg3), args(nullptr), entryExited(false), running(false),
-      returnValue(nullptr), exception(nullptr, nullptr, nullptr), context(nullptr), returnContext(nullptr) {
+    : function(function),
+      arg1(arg1),
+      arg2(arg2),
+      arg3(arg3),
+      args(nullptr),
+      entryExited(false),
+      running(false),
+      returnValue(nullptr),
+      exception(nullptr, nullptr, nullptr),
+      context(nullptr),
+      returnContext(nullptr) {
 
     int numArgs = function->f->num_args;
     if (numArgs > 3) {
@@ -337,6 +409,11 @@ void setupGenerator() {
 
     generator_cls->giveAttr("close", new BoxedFunction(boxRTFunction((void*)generatorClose, UNKNOWN, 1)));
     generator_cls->giveAttr("next", new BoxedFunction(boxRTFunction((void*)generatorNext, UNKNOWN, 1)));
+
+    CLFunction* hasnext = boxRTFunction((void*)generatorHasnextUnboxed, BOOL, 1);
+    addRTFunction(hasnext, (void*)generatorHasnext, BOXED_BOOL);
+    generator_cls->giveAttr("__hasnext__", new BoxedFunction(hasnext));
+
     generator_cls->giveAttr("send", new BoxedFunction(boxRTFunction((void*)generatorSend, UNKNOWN, 2)));
     auto gthrow = new BoxedFunction(boxRTFunction((void*)generatorThrow, UNKNOWN, 4, 2, false, false), { NULL, NULL });
     generator_cls->giveAttr("throw", gthrow);

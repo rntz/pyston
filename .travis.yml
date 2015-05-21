@@ -23,6 +23,7 @@ addons:
     - clang-3.5
     - cmake
     - g++-4.8
+    - gdb
     - libgmp3-dev
     - liblzma-dev
     - libncurses5-dev
@@ -32,6 +33,7 @@ addons:
     - ninja-build
     - python-dev
     - texlive-extra-utils
+    - libcurl4-openssl-dev
 
 before_install:
   - if [ "$CC" = "clang" ]; then export CC="clang-3.5" CXX="clang++-3.5"; fi
@@ -51,7 +53,8 @@ script:
   - ccache -z
   - ninja -j4 pyston
   - ccache -s
-  - ninja check-pyston
+  - PYSTON_RUN_ARGS=G ninja check-pyston
+  - PYSTON_RUN_ARGS=G python $TRAVIS_BUILD_DIR/tools/tester.py -R ./pyston -a=-S -k -t180 --exit-code-only $TRAVIS_BUILD_DIR/test/extra
 
 os:
   - linux

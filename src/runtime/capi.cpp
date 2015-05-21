@@ -38,9 +38,9 @@ namespace pyston {
 
 BoxedClass* method_cls;
 
-extern "C" bool _PyIndex_Check(PyObject* op) noexcept {
-    // TODO this is wrong (the CPython version checks for things that can be coerced to a number):
-    return PyInt_Check(op);
+extern "C" bool _PyIndex_Check(PyObject* obj) noexcept {
+    return (Py_TYPE(obj)->tp_as_number != NULL && PyType_HasFeature(Py_TYPE(obj), Py_TPFLAGS_HAVE_INDEX)
+            && Py_TYPE(obj)->tp_as_number->nb_index != NULL);
 }
 
 extern "C" bool _PyObject_CheckBuffer(PyObject* obj) noexcept {
@@ -50,11 +50,10 @@ extern "C" bool _PyObject_CheckBuffer(PyObject* obj) noexcept {
 
 extern "C" {
 int Py_Py3kWarningFlag;
-}
 
 BoxedClass* capifunc_cls;
-
 BoxedClass* wrapperdescr_cls, *wrapperobject_cls;
+}
 
 Box* BoxedWrapperDescriptor::__get__(BoxedWrapperDescriptor* self, Box* inst, Box* owner) {
     RELEASE_ASSERT(self->cls == wrapperdescr_cls, "");
@@ -687,6 +686,13 @@ void checkAndThrowCAPIException() {
     }
 }
 
+extern "C" void Py_Exit(int sts) noexcept {
+    // Py_Finalize();
+
+    Stats::dump(false);
+    exit(sts);
+}
+
 extern "C" void PyErr_Restore(PyObject* type, PyObject* value, PyObject* traceback) noexcept {
     cur_thread_state.curexc_type = type;
     cur_thread_state.curexc_value = value;
@@ -1191,10 +1197,9 @@ extern "C" PyObject* Py_FindMethod(PyMethodDef* methods, PyObject* self, const c
 }
 
 extern "C" PyObject* PyCFunction_NewEx(PyMethodDef* ml, PyObject* self, PyObject* module) noexcept {
-    RELEASE_ASSERT(module == NULL, "not implemented");
     assert((ml->ml_flags & (~(METH_VARARGS | METH_KEYWORDS | METH_NOARGS | METH_O))) == 0);
 
-    return new BoxedCApiFunction(ml->ml_flags, self, ml->ml_name, ml->ml_meth);
+    return new BoxedCApiFunction(ml->ml_flags, self, ml->ml_name, ml->ml_meth, module);
 }
 
 extern "C" PyCFunction PyCFunction_GetFunction(PyObject* op) noexcept {
@@ -1234,6 +1239,26 @@ extern "C" int PyEval_GetRestricted(void) noexcept {
 
 extern "C" void PyEval_InitThreads(void) noexcept {
     // nothing to do here
+}
+
+extern "C" void PyEval_AcquireThread(PyThreadState* tstate) noexcept {
+    Py_FatalError("Unimplemented");
+}
+
+extern "C" void PyEval_ReleaseThread(PyThreadState* tstate) noexcept {
+    Py_FatalError("Unimplemented");
+}
+
+extern "C" PyThreadState* PyThreadState_Get(void) noexcept {
+    Py_FatalError("Unimplemented");
+}
+
+extern "C" PyThreadState* PyEval_SaveThread(void) noexcept {
+    Py_FatalError("Unimplemented");
+}
+
+extern "C" void PyEval_RestoreThread(PyThreadState* tstate) noexcept {
+    Py_FatalError("Unimplemented");
 }
 
 extern "C" char* PyModule_GetName(PyObject* m) noexcept {
@@ -1284,6 +1309,15 @@ BoxedModule* importCExtension(const std::string& full_name, const std::string& l
     }
 
     assert(init);
+
+    // Let the GC know about the static variables.
+    uintptr_t bss_start = (uintptr_t)dlsym(handle, "__bss_start");
+    uintptr_t bss_end = (uintptr_t)dlsym(handle, "_end");
+    RELEASE_ASSERT(bss_end - bss_start < 100000, "Large BSS section detected - there maybe something wrong");
+    // only track void* aligned memory
+    bss_start = (bss_start + (sizeof(void*) - 1)) & ~(sizeof(void*) - 1);
+    bss_end -= bss_end % sizeof(void*);
+    gc::registerPotentialRootRange((void*)bss_start, (void*)bss_end);
 
     char* packagecontext = strdup(full_name.c_str());
     char* oldcontext = _Py_PackageContext;
@@ -1370,6 +1404,27 @@ extern "C" PyVarObject* _PyObject_GC_NewVar(PyTypeObject* tp, Py_ssize_t nitems)
     return op;
 }
 
+extern "C" void PyObject_GC_Del(void* op) noexcept {
+    PyObject_FREE(op);
+}
+
+#ifdef HAVE_GCC_ASM_FOR_X87
+
+/* inline assembly for getting and setting the 387 FPU control word on
+   gcc/x86 */
+
+extern "C" unsigned short _Py_get_387controlword(void) noexcept {
+    unsigned short cw;
+    __asm__ __volatile__("fnstcw %0" : "=m"(cw));
+    return cw;
+}
+
+extern "C" void _Py_set_387controlword(unsigned short cw) noexcept {
+    __asm__ __volatile__("fldcw %0" : : "m"(cw));
+}
+
+#endif
+
 extern "C" void _Py_FatalError(const char* fmt, const char* function, const char* message) {
     fprintf(stderr, fmt, function, message);
     fflush(stderr); /* it helps in Windows debug build */
@@ -1383,6 +1438,10 @@ void setupCAPI() {
     auto capi_call = new BoxedFunction(boxRTFunction((void*)BoxedCApiFunction::__call__, UNKNOWN, 1, 0, true, true));
     capi_call->f->internal_callable = BoxedCApiFunction::callInternal;
     capifunc_cls->giveAttr("__call__", capi_call);
+    capifunc_cls->giveAttr("__name__",
+                           new (pyston_getset_cls) BoxedGetsetDescriptor(BoxedCApiFunction::getname, NULL, NULL));
+    capifunc_cls->giveAttr(
+        "__module__", new BoxedMemberDescriptor(BoxedMemberDescriptor::OBJECT, offsetof(BoxedCApiFunction, module)));
 
     capifunc_cls->freeze();
 

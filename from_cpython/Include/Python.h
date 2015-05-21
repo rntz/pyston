@@ -74,6 +74,7 @@
 #include "setobject.h"
 #include "methodobject.h"
 #include "moduleobject.h"
+#include "funcobject.h"
 #include "classobject.h"
 #include "cobject.h"
 #include "fileobject.h"
@@ -110,6 +111,10 @@
 
 #include "pyfpe.h"
 
+#define Py_single_input 256
+#define Py_file_input 257
+#define Py_eval_input 258
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -131,6 +136,9 @@ PyObject* PyGC_AddRoot(PyObject*) PYSTON_NOEXCEPT;
 #define PyDoc_VAR(name) static char name[]
 #define PyDoc_STRVAR(name, str) PyDoc_VAR(name) = PyDoc_STR(str)
 #define PyDoc_STR(str) str
+
+// This is in Python-ast.h in CPython, which we don't yet have:
+int PyAST_Check(PyObject* obj) PYSTON_NOEXCEPT;
 
 #ifdef __cplusplus
 #define PyMODINIT_FUNC extern "C" void

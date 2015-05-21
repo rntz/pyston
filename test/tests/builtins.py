@@ -27,7 +27,9 @@ class C(object):
 
 print sum([C(1), C(2), C(3)], C(4)).n
 
+print zip()
 print zip([1, 2, 3, 0], ["one", "two", "three"])
+print zip([1, 2, 3, 0], ["one", "two", "three"], ["uno", "dos", "tres", "quatro"])
 
 print filter(lambda x: x % 2, xrange(20))
 print type(enumerate([]))
@@ -40,6 +42,8 @@ print isinstance(1, int)
 print isinstance(1, (float, int))
 print isinstance(1, (float, (), (int, 3), 4))
 
+print pow(11, 42)
+print pow(11, 42, 75)
 print divmod(5, 2)
 print divmod(5L, -2)
 try:
@@ -103,8 +107,8 @@ print callable(lambda: 1)
 
 print range(5L, 7L)
 
-print round(-1.1), round(-1.9)
-print round(0.5), round(-0.5)
+for n in [0, 1, 2, 3, 4, 5]:
+    print round(-1.1, n), round(-1.9, n), round(0.5, n), round(-0.5, n), round(-0.123456789, n), round(1, n)
 
 print list(iter(xrange(100).__iter__().next, 20))
 

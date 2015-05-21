@@ -1,8 +1,8 @@
 # run_args: -n
 #
 # statcheck: "-O" in EXTRA_JIT_ARGS or 'slowpath_getclsattr' in stats or 'slowpath_callattr' in stats
-# statcheck: stats.get('slowpath_getclsattr', 0) <= 20
-# statcheck: stats.get('slowpath_callattr', 0) <= 22
+# statcheck: noninit_count('slowpath_getclsattr') <= 20
+# statcheck: noninit_count('slowpath_callattr') <= 22
 
 for i in xrange(1000):
     print i
@@ -14,4 +14,7 @@ for i in xrange(10, -10, -3):
     print i
 
 for i in xrange(0):
+    print i
+
+for i in xrange(10L, 15L, 1L):
     print i

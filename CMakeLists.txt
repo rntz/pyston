@@ -93,7 +93,7 @@ endif()
 add_subdirectory(${DEPS_DIR}/llvm-trunk ${CMAKE_BINARY_DIR}/llvm EXCLUDE_FROM_ALL)
 set(CMAKE_MODULE_PATH "${CMAKE_BINARY_DIR}/llvm/share/llvm/cmake/")
 include(LLVMConfig)
-llvm_map_components_to_libnames(LLVM_LIBS core mcjit native bitreader ipo irreader debuginfodwarf instrumentation ${INTEL_JIT_EVENTS_LIB})
+llvm_map_components_to_libnames(LLVM_LIBS core mcjit native bitreader bitwriter ipo irreader debuginfodwarf instrumentation ${INTEL_JIT_EVENTS_LIB})
 
 # libunwind
 if("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
@@ -211,7 +211,7 @@ add_test(NAME analysis_unittest COMMAND analysis_unittest)
 add_test(NAME pyston_defaults COMMAND ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/tester.py -R ./pyston -j${TEST_THREADS} -a=-S -k ${CMAKE_SOURCE_DIR}/test/tests)
 # we pass -I to cpython tests and skip failing ones b/c they are slooow otherwise
 add_test(NAME pyston_defaults_cpython_tests COMMAND ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/tester.py -R ./pyston -j${TEST_THREADS} -a=-S -k --exit-code-only --skip-failing -t30 ${CMAKE_SOURCE_DIR}/test/cpython)
-add_test(NAME pyston_defaults_integration_tests COMMAND ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/tester.py -R ./pyston -j${TEST_THREADS} -a=-S -k --exit-code-only --skip-failing -t180 ${CMAKE_SOURCE_DIR}/test/integration)
+add_test(NAME pyston_defaults_integration_tests COMMAND ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/tester.py -R ./pyston -j${TEST_THREADS} -a=-S -k --exit-code-only --skip-failing -t300 ${CMAKE_SOURCE_DIR}/test/integration)
 add_test(NAME pyston_max_compilation_tier COMMAND ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/tester.py -R ./pyston -j${TEST_THREADS} -a=-O -a=-S -k ${CMAKE_SOURCE_DIR}/test/tests)
 add_test(NAME pyston_old_parser COMMAND ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/tester.py -a=-x -R ./pyston -j1 -a=-n -a=-S -k ${CMAKE_SOURCE_DIR}/test/tests)
 
@@ -224,7 +224,7 @@ add_custom_target(check-format ${CMAKE_SOURCE_DIR}/tools/check_format.sh ${LLVM_
 add_custom_target(lint ${PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tools/lint.py WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/src)
 
 # check
-add_custom_target(check-pyston COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure DEPENDS pyston copy_stdlib copy_libpyston clang-format ext_cpython ext_pyston unittests) 
+add_custom_target(check-pyston COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure DEPENDS pyston copy_stdlib copy_libpyston clang-format ext_cpython ext_pyston unittests sharedmods)
 
 # {run,dbg,perf,memcheck,memleaks,cachegrind}_TESTNAME
 file(GLOB RUNTARGETS ${CMAKE_SOURCE_DIR}/test/tests/*.py ${CMAKE_SOURCE_DIR}/microbenchmarks/*.py ${CMAKE_SOURCE_DIR}/minibenchmarks/*.py)

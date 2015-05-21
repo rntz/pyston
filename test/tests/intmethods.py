@@ -13,6 +13,9 @@ for i in xrange(1, 12):
 print 1 ** 0
 print 0 ** 0
 print -1 ** 0
+print (11).__pow__(5, 50)
+print (11).__pow__(32, 50)
+print (11).__index__()
 
 for i in (-10, 10, 0, -15):
     print i, i.__hex__(), i.__oct__()
@@ -63,6 +66,9 @@ class L(object):
 print type(int(L()))
 
 print int(u'123')
+print int("9223372036854775808", 0)
+print 1 << 63, 1 << 64, -1 << 63, -1 << 64, 2 << 63
+print type(1 << 63), type(1 << 64), type(-1 << 63), type(-1 << 64), type(2 << 63)
 
 for b in range(26):
     try:
@@ -73,3 +79,11 @@ for b in range(26):
         print int(u'123', b)
     except ValueError as e:
         print e
+
+
+class I(int):
+    pass
+
+for i1 in [1, I(2), 3, I(4)]:
+    for i2 in [1, I(2), 3, I(4)]:
+        print -i1, +i1, ~i1, i1 < i2, i1 <= i2, i1 == i2, i1 > i2, i1 >= i2, i1 != i2, i1 | i2, i1 ^ i2, i1 & i2, i1 * i2, i1 + i2, i1 / i2, i1 - i2, i1 ** i2, i1 // i2

@@ -41,6 +41,7 @@ bool ENABLE_INTERPRETER = true;
 bool ENABLE_PYPA_PARSER = true;
 bool USE_REGALLOC_BASIC = true;
 bool PAUSE_AT_ABORT = false;
+bool ENABLE_TRACEBACKS = true;
 
 int OSR_THRESHOLD_INTERPRETER = 500;
 int REOPT_THRESHOLD_INTERPRETER = 200;
@@ -82,6 +83,7 @@ bool BOOLS_AS_I64 = ENABLE_FRAME_INTROSPECTION;
 extern "C" {
 int Py_FrozenFlag = 1;
 int Py_IgnoreEnvironmentFlag = 0;
+int Py_InspectFlag = 0;
 int Py_NoSiteFlag = 0;
 int Py_OptimizeFlag = 0;
 int Py_VerboseFlag = 0;

@@ -22,6 +22,7 @@
 
 #include "core/common.h"
 #include "core/threading.h"
+#include "core/types.h"
 
 namespace pyston {
 
@@ -136,7 +137,7 @@ public:
         assert(((uint8_t*)cur + size) < end && "arena full");
 
         void* mrtn = mmap(cur, size, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        assert((uintptr_t)mrtn != -1 && "failed to allocate memory from OS");
+        RELEASE_ASSERT((uintptr_t)mrtn != -1, "failed to allocate memory from OS");
         ASSERT(mrtn == cur, "%p %p\n", mrtn, cur);
         cur = (uint8_t*)cur + size;
         return mrtn;
@@ -195,7 +196,7 @@ public:
     void free(GCAllocation* al);
 
     GCAllocation* allocationFrom(void* ptr);
-    void freeUnmarked(std::list<Box*, StlCompatAllocator<Box*>>& weakly_referenced);
+    void freeUnmarked(std::vector<Box*>& weakly_referenced);
 
     void getStatistics(HeapStatistics* stats);
 
@@ -327,7 +328,7 @@ private:
     Block* _allocBlock(uint64_t size, Block** prev);
     GCAllocation* _allocFromBlock(Block* b);
     Block* _claimBlock(size_t rounded_size, Block** free_head);
-    Block** _freeChain(Block** head, std::list<Box*, StlCompatAllocator<Box*>>& weakly_referenced);
+    Block** _freeChain(Block** head, std::vector<Box*>& weakly_referenced);
     void _getChainStatistics(HeapStatistics* stats, Block** head);
 
     GCAllocation* __attribute__((__malloc__)) _alloc(size_t bytes, int bucket_idx);
@@ -400,7 +401,7 @@ public:
     void free(GCAllocation* alloc);
 
     GCAllocation* allocationFrom(void* ptr);
-    void freeUnmarked(std::list<Box*, StlCompatAllocator<Box*>>& weakly_referenced);
+    void freeUnmarked(std::vector<Box*>& weakly_referenced);
 
     void getStatistics(HeapStatistics* stats);
 };
@@ -418,7 +419,7 @@ public:
     void free(GCAllocation* alloc);
 
     GCAllocation* allocationFrom(void* ptr);
-    void freeUnmarked(std::list<Box*, StlCompatAllocator<Box*>>& weakly_referenced);
+    void freeUnmarked(std::vector<Box*>& weakly_referenced);
 
     void getStatistics(HeapStatistics* stats);
 
@@ -529,19 +530,19 @@ public:
     }
 
     // not thread safe:
-    void freeUnmarked(std::list<Box*, StlCompatAllocator<Box*>>& weakly_referenced) {
+    void freeUnmarked(std::vector<Box*>& weakly_referenced) {
         small_arena.freeUnmarked(weakly_referenced);
         large_arena.freeUnmarked(weakly_referenced);
         huge_arena.freeUnmarked(weakly_referenced);
     }
 
-    void dumpHeapStatistics();
+    void dumpHeapStatistics(int level);
 
     friend void markPhase();
 };
 
 extern Heap global_heap;
-void dumpHeapStatistics();
+void dumpHeapStatistics(int level);
 
 } // namespace gc
 } // namespace pyston

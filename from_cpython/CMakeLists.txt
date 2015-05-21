@@ -62,6 +62,7 @@ file(GLOB_RECURSE STDMODULE_SRCS Modules
     socketmodule.c
     statement.c
     stringio.c
+    stropmodule.c
     textio.c
     timemodule.c
     unicodedata.c
@@ -94,6 +95,7 @@ file(GLOB_RECURSE STDPYTHON_SRCS Python
     formatter_unicode.c
     getargs.c
     marshal.c
+    mystrtoul.c
     pyctype.c
     pystrtod.c
     structmember.c
@@ -106,3 +108,15 @@ file(GLOB_RECURSE STDPARSER_SRCS Parser
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-missing-field-initializers -Wno-tautological-compare -Wno-type-limits -Wno-unused-result -Wno-strict-aliasing")
 add_library(FROM_CPYTHON OBJECT ${STDMODULE_SRCS} ${STDOBJECT_SRCS} ${STDPYTHON_SRCS} ${STDPARSER_SRCS})
+
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/lib_pyston/_multiprocessing.pyston.so
+                   COMMAND ${CMAKE_BINARY_DIR}/pyston setup.py build --build-lib ${CMAKE_BINARY_DIR}/lib_pyston
+                   DEPENDS
+                       pyston
+                       copy_stdlib
+                       copy_libpyston
+                       Modules/_multiprocessing/multiprocessing.c
+                       Modules/_multiprocessing/semaphore.c
+                       Modules/_multiprocessing/socket_connection.c
+                   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_custom_target(sharedmods DEPENDS ${CMAKE_BINARY_DIR}/lib_pyston/_multiprocessing.pyston.so)

@@ -44,6 +44,7 @@ from collections import namedtuple
 # Pyston change: we don't support all of these flags yet, so just enable the ones that we do:
 CO_VARARGS = 0x4
 CO_VARKEYWORDS = 0x8
+CO_GENERATOR = 0x20
 # These constants are from Include/code.h.
 # CO_OPTIMIZED, CO_NEWLOCALS, CO_VARARGS, CO_VARKEYWORDS = 0x1, 0x2, 0x4, 0x8
 # CO_NESTED, CO_GENERATOR, CO_NOFREE = 0x10, 0x20, 0x40
@@ -816,6 +817,11 @@ def getargspec(func):
     if ismethod(func):
         func = func.im_func
     if not isfunction(func):
+        raise TypeError('{!r} is not a Python function'.format(func))
+    # Pyston change: many of our builtin functions are of type FunctionType, but
+    # don't have full introspection available.  I think this check catches most of them,
+    # though I think it allows some cases that CPython does not:
+    if func.func_code.co_argcount > len(func.func_code.co_varnames):
         raise TypeError('{!r} is not a Python function'.format(func))
     args, varargs, varkw = getargs(func.func_code)
     return ArgSpec(args, varargs, varkw, func.func_defaults)

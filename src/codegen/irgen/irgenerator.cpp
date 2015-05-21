@@ -42,6 +42,27 @@ extern "C" void dumpLLVM(llvm::Value* v) {
     v->dump();
 }
 
+IRGenState::IRGenState(CompiledFunction* cf, SourceInfo* source_info, std::unique_ptr<LivenessAnalysis> liveness,
+                       std::unique_ptr<PhiAnalysis> phis, ParamNames* param_names, GCBuilder* gc,
+                       llvm::MDNode* func_dbg_info)
+    : cf(cf),
+      source_info(source_info),
+      liveness(std::move(liveness)),
+      phis(std::move(phis)),
+      param_names(param_names),
+      gc(gc),
+      func_dbg_info(func_dbg_info),
+      scratch_space(NULL),
+      frame_info(NULL),
+      frame_info_arg(NULL),
+      scratch_size(0) {
+    assert(cf->func);
+    assert(!cf->clfunc); // in this case don't need to pass in sourceinfo
+}
+
+IRGenState::~IRGenState() {
+}
+
 llvm::Value* IRGenState::getScratchSpace(int min_bytes) {
     llvm::BasicBlock& entry_block = getLLVMFunction()->getEntryBlock();
 
@@ -289,7 +310,8 @@ public:
     explicit IREmitterImpl(IRGenState* irstate, llvm::BasicBlock*& curblock, IRGenerator* irgenerator)
         : irstate(irstate), builder(new IRBuilder(g.context)), curblock(curblock), irgenerator(irgenerator) {
 
-        ASSERT(irstate->getSourceInfo()->scoping->areGlobalsFromModule(), "jit doesn't support custom globals yet");
+        RELEASE_ASSERT(irstate->getSourceInfo()->scoping->areGlobalsFromModule(),
+                       "jit doesn't support custom globals yet");
 
         builder->setEmitter(this);
         builder->SetInsertPoint(curblock);
@@ -424,8 +446,13 @@ private:
 public:
     IRGeneratorImpl(IRGenState* irstate, std::unordered_map<CFGBlock*, llvm::BasicBlock*>& entry_blocks,
                     CFGBlock* myblock, TypeAnalysis* types)
-        : irstate(irstate), curblock(entry_blocks[myblock]), emitter(irstate, curblock, this),
-          entry_blocks(entry_blocks), myblock(myblock), types(types), state(RUNNING) {}
+        : irstate(irstate),
+          curblock(entry_blocks[myblock]),
+          emitter(irstate, curblock, this),
+          entry_blocks(entry_blocks),
+          myblock(myblock),
+          types(types),
+          state(RUNNING) {}
 
     ~IRGeneratorImpl() { delete emitter.getBuilder(); }
 
@@ -472,7 +499,10 @@ private:
         emitter.getBuilder()->SetInsertPoint(curblock);
         llvm::Value* v = emitter.createCall2(UnwindInfo(current_statement, NULL), g.funcs.deopt,
                                              embedRelocatablePtr(node, g.i8->getPointerTo()), node_value);
-        emitter.getBuilder()->CreateRet(v);
+        if (irstate->getReturnType() == VOID)
+            emitter.getBuilder()->CreateRetVoid();
+        else
+            emitter.getBuilder()->CreateRet(v);
 
         curblock = success_bb;
         emitter.getBuilder()->SetInsertPoint(curblock);
@@ -944,7 +974,7 @@ private:
     CompilerVariable* evalName(AST_Name* node, UnwindInfo unw_info) {
         auto scope_info = irstate->getScopeInfo();
 
-        bool is_kill = irstate->getSourceInfo()->liveness->isKill(node, myblock);
+        bool is_kill = irstate->getLiveness()->isKill(node, myblock);
         assert(!is_kill || node->id.str()[0] == '#');
 
         ScopeInfo::VarScopeType vst = scope_info->getScopeTypeOfName(node->id);
@@ -1244,7 +1274,12 @@ private:
         // TODO duplication with _createFunction:
         CompilerVariable* created_closure = NULL;
         if (scope_info->takesClosure()) {
-            created_closure = symbol_table[internString(CREATED_CLOSURE_NAME)];
+            if (irstate->getScopeInfo()->createsClosure()) {
+                created_closure = symbol_table[internString(CREATED_CLOSURE_NAME)];
+            } else {
+                assert(irstate->getScopeInfo()->passesThroughClosure());
+                created_closure = symbol_table[internString(PASSED_CLOSURE_NAME)];
+            }
             assert(created_closure);
         }
 
@@ -1253,7 +1288,7 @@ private:
         // but since the classdef can't create its own closure, shouldn't need to explicitly
         // create that scope to pass the closure through.
         assert(irstate->getSourceInfo()->scoping->areGlobalsFromModule());
-        CompilerVariable* func = makeFunction(emitter, cl, created_closure, false, NULL, {});
+        CompilerVariable* func = makeFunction(emitter, cl, created_closure, NULL, {});
 
         CompilerVariable* attr_dict = func->call(emitter, getEmptyOpInfo(unw_info), ArgPassSpec(0), {}, NULL);
 
@@ -1317,7 +1352,7 @@ private:
         }
 
         assert(irstate->getSourceInfo()->scoping->areGlobalsFromModule());
-        CompilerVariable* func = makeFunction(emitter, cl, created_closure, is_generator, NULL, defaults);
+        CompilerVariable* func = makeFunction(emitter, cl, created_closure, NULL, defaults);
 
         for (auto d : defaults) {
             d->decvref(emitter);
@@ -1644,6 +1679,7 @@ private:
     }
 
     void doAssert(AST_Assert* node, UnwindInfo unw_info) {
+        // cfg translates all asserts into only 'assert 0' on the failing path.
         AST_expr* test = node->test;
         assert(test->type == AST_TYPE::Num);
         AST_Num* num = ast_cast<AST_Num>(test);
@@ -1651,7 +1687,12 @@ private:
         assert(num->n_int == 0);
 
         std::vector<llvm::Value*> llvm_args;
-        llvm_args.push_back(embedParentModulePtr());
+
+        // We could patchpoint this or try to avoid the overhead, but this should only
+        // happen when the assertion is actually thrown so I don't think it will be necessary.
+        static std::string AssertionError_str("AssertionError");
+        llvm_args.push_back(emitter.createCall2(unw_info, g.funcs.getGlobal, embedParentModulePtr(),
+                                                embedRelocatablePtr(&AssertionError_str, g.llvm_str_type_ptr)));
 
         ConcreteCompilerVariable* converted_msg = NULL;
         if (node->msg) {
@@ -2272,7 +2313,7 @@ private:
             // ASSERT(p.first[0] != '!' || isIsDefinedName(p.first), "left a fake variable in the real
             // symbol table? '%s'", p.first.c_str());
 
-            if (!source->liveness->isLiveAtEnd(p.first, myblock)) {
+            if (!irstate->getLiveness()->isLiveAtEnd(p.first, myblock)) {
                 // printf("%s dead at end of %d; grabbed = %d, %d vrefs\n", p.first.c_str(), myblock->idx,
                 //        p.second->isGrabbed(), p.second->getVrefs());
 

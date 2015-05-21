@@ -1,3 +1,9 @@
+# Some parsing tests:
+print ((1, 2),)
+print (1, 2, 3)
+print (1,2,)
+print (1,)
+
 t = (1, "h")
 print t, str(t), repr(t)
 if 1:
@@ -133,6 +139,7 @@ except TypeError, e:
 t = (1, "2")
 print t[0]
 print t[1]
+print t[1L]
 
 t = (1, 2, 'a', 'b', 'c')
 print t[::-1]

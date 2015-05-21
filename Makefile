@@ -52,6 +52,11 @@ FORCE_TRUNK_BINARIES := 0
 USE_CMAKE := 1
 NINJA := ninja
 
+CMAKE_DIR_DBG := $(HOME)/pyston-build-dbg
+CMAKE_DIR_RELEASE := $(HOME)/pyston-build-release
+CMAKE_SETUP_DBG := $(CMAKE_DIR_DBG)/build.ninja
+CMAKE_SETUP_RELEASE := $(CMAKE_DIR_RELEASE)/build.ninja
+
 # Put any overrides in here:
 -include Makefile.local
 
@@ -100,7 +105,7 @@ else
 	LLVM_BIN := $(LLVM_BUILD)/Release/bin
 endif
 
-LLVM_LINK_LIBS := core mcjit native bitreader ipo irreader debuginfodwarf instrumentation
+LLVM_LINK_LIBS := core mcjit native bitreader bitwriter ipo irreader debuginfodwarf instrumentation
 ifneq ($(ENABLE_INTEL_JIT_EVENTS),0)
 LLVM_LINK_LIBS += inteljitevents
 endif
@@ -110,12 +115,25 @@ ifeq ($(NEED_OLD_JIT),1)
 	LLVM_LINK_LIBS += jit
 endif
 
+LLVM_CONFIG_DBG := $(LLVM_BUILD)/Release+Asserts/bin/llvm-config
+ifneq ($(wildcard $(LLVM_CONFIG_DBG)),)
 LLVM_CXXFLAGS := $(shell $(LLVM_BUILD)/Release+Asserts/bin/llvm-config --cxxflags)
 LLVM_LDFLAGS := $(shell $(LLVM_BUILD)/Release+Asserts/bin/llvm-config --ldflags --system-libs --libs $(LLVM_LINK_LIBS))
 LLVM_LIB_DEPS := $(wildcard $(LLVM_BUILD)/Release+Asserts/lib/*)
+else
+LLVM_CXXFLAGS := DBG_NOT_BUILT
+LLVM_LDFLAGS := DBG_NOT_BUILT
+LLVM_LIB_DEPS := DBG_NOT_BUILT
+endif
 
+LLVM_CONFIG_DEBUG := $(LLVM_BUILD)/Debug+Asserts/bin/llvm-config
+ifneq ($(wildcard $(LLVM_CONFIG_DEBUG)),)
 LLVM_DEBUG_LDFLAGS := $(shell $(LLVM_BUILD)/Debug+Asserts/bin/llvm-config --ldflags --system-libs --libs $(LLVM_LINK_LIBS))
 LLVM_DEBUG_LIB_DEPS := $(wildcard $(LLVM_BUILD)/Debug+Asserts/lib/*)
+else
+LLVM_DEBUG_LDFLAGS := DEBUG_NOT_BUILT
+LLVM_DEBUG_LIB_DEPS := DEBUG_NOT_BUILT
+endif
 
 LLVM_CONFIG_RELEASE := $(LLVM_BUILD)/Release/bin/llvm-config
 ifneq ($(wildcard $(LLVM_CONFIG_RELEASE)),)
@@ -354,6 +372,7 @@ STDMODULE_SRCS := \
 	_sqlite/row.c \
 	_sqlite/statement.c \
 	_sqlite/util.c \
+	stropmodule.c \
 	$(EXTRA_STDMODULE_SRCS)
 
 STDOBJECT_SRCS := \
@@ -381,6 +400,7 @@ STDPYTHON_SRCS := \
 	formatter_unicode.c \
 	structmember.c \
 	marshal.c \
+	mystrtoul.c \
 	$(EXTRA_STDPYTHON_SRCS)
 
 STDPARSER_SRCS := \
@@ -403,16 +423,33 @@ UNITTEST_SRCS := $(wildcard $(UNITTEST_DIR)/*.cpp)
 
 NONSTDLIB_SRCS := $(MAIN_SRCS) $(OPTIONAL_SRCS) $(TOOL_SRCS) $(UNITTEST_SRCS)
 
-.DEFAULT_GOAL := pyston_dbg
-# _ :
-	# $(MAKE) pyston_dbg || (clear; $(MAKE) pyston_dbg -j1 ERROR_LIMIT=1)
+.DEFAULT_GOAL := small_all
+
+# The set of dependencies (beyond the executable) required to do `make run_foo`.
+# ext_pyston (building test/test_extension) is required even in cmake mode since
+# we manually add test/test_extension to the path
+RUN_DEPS := ext_pyston
+ifneq ($(USE_CMAKE),1)
+	RUN_DEPS := $(RUN_DEPS) sharedmods
+endif
+
+# The set of dependencies (beyond the executable) required to do `make check` / `make check_foo`.
+# The tester bases all paths based on the executable, so in cmake mode we need to have cmake
+# build all of the shared modules.
+CHECK_DEPS :=
+ifneq ($(USE_CMAKE),1)
+	CHECK_DEPS := ext_pyston ext_python sharedmods
+endif
+
+.PHONY: small_all
+small_all: pyston_dbg $(RUN_DEPS)
 
 .PHONY: all _all
 # all: llvm
 	# @# have to do this in a recursive make so that dependency is enforced:
 	# $(MAKE) pyston_all
 # all: pyston_dbg pyston_release pyston_oprof pyston_prof $(OPTIONAL_SRCS:.cpp=.o) ext_python ext_pyston
-all: pyston_dbg pyston_release pyston_prof ext_python ext_pyston unittests
+all: pyston_dbg pyston_release pyston_gcc unittests $(RUN_DEPS) $(CHECK_DEPS)
 
 ALL_HEADERS := $(wildcard src/*/*.h) $(wildcard src/*/*/*.h) $(wildcard from_cpython/Include/*.h)
 tags: $(SRCS) $(OPTIONAL_SRCS) $(FROM_CPYTHON_SRCS) $(ALL_HEADERS)
@@ -438,10 +475,10 @@ $1_unittest:
 	ln -sf $(HOME)/pyston-build-dbg/$1_unittest .
 endif
 dbg_$1_unittests: $1_unittest
-	zsh -c 'ulimit -v $(MAX_MEM_KB); ulimit -d $(MAX_MEM_KB); time $(GDB) $(GDB_CMDS) --args ./$1_unittest --gtest_break_on_failure $(ARGS)'
+	zsh -c 'ulimit -m $(MAX_MEM_KB); time $(GDB) $(GDB_CMDS) --args ./$1_unittest --gtest_break_on_failure $(ARGS)'
 unittests:: $1_unittest
 run_$1_unittests: $1_unittest
-	zsh -c 'ulimit -v $(MAX_MEM_KB); ulimit -d $(MAX_MEM_KB); time ./$1_unittest $(ARGS)'
+	zsh -c 'ulimit -m $(MAX_MEM_KB); time ./$1_unittest $(ARGS)'
 run_unittests:: run_$1_unittests
 )
 endef
@@ -468,9 +505,9 @@ check_format:
 	$(ECHO) checking formatting...
 	$(VERB) cd src && ../tools/check_format.sh $(LLVM_BIN)/clang-format
 else
-format:
+format: $(CMAKE_SETUP_RELEASE)
 	$(NINJA) -C $(HOME)/pyston-build-release format
-check_format:
+check_format: $(CMAKE_SETUP_RELEASE)
 	$(NINJA) -C $(HOME)/pyston-build-release check-format
 endif
 
@@ -488,17 +525,17 @@ lint: $(PYTHON_EXE_DEPS)
 cpplint:
 	$(VERB) $(PYTHON) $(TOOLS_DIR)/cpplint.py --filter=-whitespace,-build/header_guard,-build/include_order,-readability/todo $(SRCS)
 
-.PHONY: check quick_check
+.PHONY: check
 check:
 	@# These are ordered roughly in decreasing order of (chance will expose issue) / (time to run test)
 	$(MAKE) lint
 	$(MAKE) check_format
-	$(MAKE) ext_python ext_pyston pyston_dbg
+	$(MAKE) pyston_dbg $(CHECK_DEPS)
 
 	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston_dbg -j$(TEST_THREADS) -k -a=-S $(TESTS_DIR) $(ARGS)
 	@# we pass -I to cpython tests & skip failing ones because they are sloooow otherwise
 	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston_dbg -j$(TEST_THREADS) -k -a=-S --exit-code-only --skip-failing -t30 $(TEST_DIR)/cpython $(ARGS)
-	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston_dbg -j$(TEST_THREADS) -k -a=-S --exit-code-only --skip-failing -t180 $(TEST_DIR)/integration $(ARGS)
+	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston_dbg -j$(TEST_THREADS) -k -a=-S --exit-code-only --skip-failing -t300 $(TEST_DIR)/integration $(ARGS)
 	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston_dbg -j$(TEST_THREADS) -k -a=-n -a=-x -a=-S $(TESTS_DIR) $(ARGS)
 	@# skip -O for dbg
 
@@ -521,19 +558,33 @@ check:
 
 	echo "All tests passed"
 
+# A stripped down set of tests, meant as a quick smoke test to run before submitting a PR and having
+# Travis-CI do the full test.
+.PHONY: quick_check
 quick_check:
-	$(MAKE) pyston_dbg
-	$(call checksha,./pyston_dbg -q  $(TESTS_DIR)/raytrace_small.py,0544f4621dd45fe94205219488a2576b84dc044d)
-	$(call checksha,./pyston_dbg -qn $(TESTS_DIR)/raytrace_small.py,0544f4621dd45fe94205219488a2576b84dc044d)
-	$(call checksha,./pyston_dbg -qO $(TESTS_DIR)/raytrace_small.py,0544f4621dd45fe94205219488a2576b84dc044d)
-	$(MAKE) pyston
-	$(call checksha,./pyston -q  $(TESTS_DIR)/raytrace_small.py,0544f4621dd45fe94205219488a2576b84dc044d)
-	$(call checksha,./pyston -qn $(TESTS_DIR)/raytrace_small.py,0544f4621dd45fe94205219488a2576b84dc044d)
-	$(call checksha,./pyston -qO $(TESTS_DIR)/raytrace_small.py,0544f4621dd45fe94205219488a2576b84dc044d)
-	$(MAKE) pyston_prof
-	$(call checksha,./pyston_prof -q  $(TESTS_DIR)/raytrace_small.py,0544f4621dd45fe94205219488a2576b84dc044d)
-	$(call checksha,./pyston_prof -qn $(TESTS_DIR)/raytrace_small.py,0544f4621dd45fe94205219488a2576b84dc044d)
-	$(call checksha,./pyston_prof -qO $(TESTS_DIR)/raytrace_small.py,0544f4621dd45fe94205219488a2576b84dc044d)
+	$(MAKE) pyston_dbg $(CHECK_DEPS)
+	$(MAKE) check_format
+	$(MAKE) unittests
+	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston_dbg -j$(TEST_THREADS) -a=-S -k --order-by-mtime $(TESTS_DIR) $(ARGS)
+	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston_dbg -j$(TEST_THREADS) -a=-S -k --exit-code-only --skip-failing $(TEST_DIR)/cpython $(ARGS)
+
+# A comprehensive test that checks that all three build formats (makefile, makefile->cmake shim, cmake) work.
+# This should only be necessary when doing work on the build system; it shouldn't be necessary for normal development.
+.PHONY: full_check
+full_check:
+	$(MAKE) clean
+	rm -rfv $(CMAKE_DIR_DBG)
+	$(MAKE) llvm_quick llvm_release USE_CMAKE=0
+	$(MAKE) check_dbg USE_CMAKE=0
+	\
+	$(MAKE) clean
+	rm -rfv $(CMAKE_DIR_DBG)
+	$(MAKE) check_dbg USE_CMAKE=0
+	\
+	$(MAKE) clean
+	rm -rfv $(CMAKE_DIR_DBG)
+	$(MAKE) $(CMAKE_SETUP_DBG)
+	ninja -C $(CMAKE_DIR_DBG) check-pyston
 
 Makefile.local:
 	echo "Creating default Makefile.local"
@@ -781,11 +832,16 @@ endef
 PASS_SRCS := codegen/opt/aa.cpp
 PASS_OBJS := $(PASS_SRCS:.cpp=.standalone.o)
 
+ifneq ($(USE_CMAKE),1)
 $(call make_compile_config,,$(CXXFLAGS_DBG))
 $(call make_compile_config,.release,$(CXXFLAGS_RELEASE))
 $(call make_compile_config,.grwl,$(CXXFLAGS_RELEASE) -DTHREADING_USE_GRWL=1 -DTHREADING_USE_GIL=0 -UBINARY_SUFFIX -DBINARY_SUFFIX=_grwl)
 $(call make_compile_config,.grwl_dbg,$(CXXFLAGS_DBG) -DTHREADING_USE_GRWL=1 -DTHREADING_USE_GIL=0 -UBINARY_SUFFIX -DBINARY_SUFFIX=_grwl_dbg -UBINARY_STRIPPED_SUFFIX -DBINARY_STRIPPED_SUFFIX=)
 $(call make_compile_config,.nosync,$(CXXFLAGS_RELEASE) -DTHREADING_USE_GRWL=0 -DTHREADING_USE_GIL=0 -UBINARY_SUFFIX -DBINARY_SUFFIX=_nosync)
+else
+%.o: %.cpp $(CMAKE_SETUP_DBG)
+	$(NINJA) -C $(HOME)/pyston-build-dbg src/CMakeFiles/PYSTON_OBJECTS.dir/$(patsubst src/%.o,%.cpp.o,$@) $(NINJAFLAGS)
+endif
 
 $(UNITTEST_SRCS:.cpp=.o): CXXFLAGS += -isystem $(GTEST_DIR)/include
 
@@ -883,10 +939,6 @@ $(call link,_debug,$(OBJS),$(LDFLAGS_DEBUG),$(LLVM_DEBUG_DEPS))
 $(call link,_release,$(OPT_OBJS),$(LDFLAGS_RELEASE),$(LLVM_RELEASE_DEPS))
 
 else
-CMAKE_DIR_DBG := $(HOME)/pyston-build-dbg
-CMAKE_DIR_RELEASE := $(HOME)/pyston-build-release
-CMAKE_SETUP_DBG := $(CMAKE_DIR_DBG)/build.ninja
-CMAKE_SETUP_RELEASE := $(CMAKE_DIR_RELEASE)/build.ninja
 .PHONY: cmake_check clang_check
 $(CMAKE_SETUP_DBG):
 	@$(MAKE) cmake_check
@@ -901,10 +953,10 @@ $(CMAKE_SETUP_RELEASE):
 
 .PHONY: pyston_dbg pyston_release
 pyston_dbg: $(CMAKE_SETUP_DBG)
-	$(NINJA) -C $(CMAKE_DIR_DBG) pyston copy_stdlib copy_libpyston ext_pyston $(NINJAFLAGS)
+	$(NINJA) -C $(CMAKE_DIR_DBG) pyston copy_stdlib copy_libpyston sharedmods ext_pyston ext_cpython $(NINJAFLAGS)
 	ln -sf $(CMAKE_DIR_DBG)/pyston pyston_dbg
 pyston_release: $(CMAKE_SETUP_RELEASE)
-	$(NINJA) -C $(CMAKE_DIR_RELEASE) pyston copy_stdlib copy_libpyston ext_pyston $(NINJAFLAGS)
+	$(NINJA) -C $(CMAKE_DIR_RELEASE) pyston copy_stdlib copy_libpyston sharedmods ext_pyston ext_cpython $(NINJAFLAGS)
 	ln -sf $(CMAKE_DIR_RELEASE)/pyston pyston_release
 endif
 CMAKE_DIR_GCC := $(HOME)/pyston-build-gcc
@@ -915,15 +967,16 @@ $(CMAKE_SETUP_GCC):
 	cd $(CMAKE_DIR_GCC); CC='$(GCC)' CXX='$(GPP)' cmake -GNinja $(HOME)/pyston -DCMAKE_BUILD_TYPE=Debug
 .PHONY: pyston_gcc
 pyston_gcc: $(CMAKE_SETUP_GCC)
-	$(NINJA) -C $(HOME)/pyston-build-gcc pyston copy_stdlib copy_libpyston ext_pyston $(NINJAFLAGS)
+	$(NINJA) -C $(HOME)/pyston-build-gcc pyston copy_stdlib copy_libpyston sharedmods ext_pyston ext_cpython $(NINJAFLAGS)
 	ln -sf $(HOME)/pyston-build-gcc/pyston pyston_gcc
 
 -include $(wildcard src/*.d) $(wildcard src/*/*.d) $(wildcard src/*/*/*.d) $(wildcard $(UNITTEST_DIR)/*.d) $(wildcard from_cpython/*/*.d) $(wildcard from_cpython/*/*/*.d)
 
 .PHONY: clean
 clean:
-	@ find src $(TOOLS_DIR) $(TEST_DIR) ./from_cpython/Modules \( -name '*.o' -o -name '*.d' -o -name '*.py_cache' -o -name '*.bc' -o -name '*.o.ll' -o -name '*.pub.ll' -o -name '*.cache' -o -name 'stdlib*.ll' -o -name '*.pyc' -o -name '*.so' -o -name '*.a' -o -name '*.expected_cache' -o -name '*.pch' \) -print -delete
+	@ find src $(TOOLS_DIR) $(TEST_DIR) ./from_cpython ./lib_pyston \( -name '*.o' -o -name '*.d' -o -name '*.py_cache' -o -name '*.bc' -o -name '*.o.ll' -o -name '*.pub.ll' -o -name '*.cache' -o -name 'stdlib*.ll' -o -name '*.pyc' -o -name '*.so' -o -name '*.a' -o -name '*.expected_cache' -o -name '*.pch' \) -print -delete
 	@ find \( -name 'pyston*' -executable -type f \) -print -delete
+	@ rm -vf pyston_dbg pyston_release pyston_gcc
 	@ find $(TOOLS_DIR) -maxdepth 0 -executable -type f -print -delete
 	@ rm -rf oprofile_data
 	@ rm -f *_unittest
@@ -943,6 +996,7 @@ $1: nosearch_$1
 $1: $(TESTS_DIR)/nosearch_$1 ;
 $1: $(TEST_DIR)/cpython/nosearch_$1 ;
 $1: $(TEST_DIR)/integration/nosearch_$1 ;
+$1: $(TEST_DIR)/extra/nosearch_$1 ;
 $1: ./microbenchmarks/nosearch_$1 ;
 $1: ./minibenchmarks/nosearch_$1 ;
 $1: ./benchmarks/nosearch_$1 ;
@@ -951,16 +1005,14 @@ $(patsubst %, $$1: %/nosearch_$$1 ;,$(EXTRA_SEARCH_DIRS))
 )
 endef
 
-RUN_DEPS := ext_pyston
-
 define make_target
 $(eval \
 .PHONY: test$1 check$1
-check$1 test$1: $(PYTHON_EXE_DEPS) pyston$1 ext_pyston
+check$1 test$1: $(PYTHON_EXE_DEPS) pyston$1 $(CHECK_DEPS)
 	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston$1 -j$(TEST_THREADS) -a=-S -k $(TESTS_DIR) $(ARGS)
 	@# we pass -I to cpython tests and skip failing ones because they are sloooow otherwise
 	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston$1 -j$(TEST_THREADS) -a=-S -k --exit-code-only --skip-failing -t30 $(TEST_DIR)/cpython $(ARGS)
-	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston$1 -j$(TEST_THREADS) -k -a=-S --exit-code-only --skip-failing -t180 $(TEST_DIR)/integration $(ARGS)
+	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston$1 -j$(TEST_THREADS) -k -a=-S --exit-code-only --skip-failing -t300 $(TEST_DIR)/integration $(ARGS)
 	$(PYTHON) $(TOOLS_DIR)/tester.py -a=-x -R pyston$1 -j$(TEST_THREADS) -a=-n -a=-S -k $(TESTS_DIR) $(ARGS)
 	$(PYTHON) $(TOOLS_DIR)/tester.py -R pyston$1 -j$(TEST_THREADS) -a=-O -a=-S -k $(TESTS_DIR) $(ARGS)
 
@@ -968,12 +1020,12 @@ check$1 test$1: $(PYTHON_EXE_DEPS) pyston$1 ext_pyston
 run$1: pyston$1 $$(RUN_DEPS)
 	PYTHONPATH=test/test_extension ./pyston$1 $$(ARGS)
 dbg$1: pyston$1 $$(RUN_DEPS)
-	PYTHONPATH=test/test_extension zsh -c 'ulimit -v $$(MAX_DBG_MEM_KB); $$(GDB) $$(GDB_CMDS) --args ./pyston$1 $$(ARGS)'
+	PYTHONPATH=test/test_extension zsh -c 'ulimit -m $$(MAX_DBG_MEM_KB); $$(GDB) $$(GDB_CMDS) --args ./pyston$1 $$(ARGS)'
 nosearch_run$1_%: %.py pyston$1 $$(RUN_DEPS)
-	$(VERB) PYTHONPATH=test/test_extension zsh -c 'ulimit -v $$(MAX_MEM_KB); ulimit -d $$(MAX_MEM_KB); time ./pyston$1 $$(ARGS) $$<'
+	$(VERB) PYTHONPATH=test/test_extension zsh -c 'ulimit -m $$(MAX_MEM_KB); time ./pyston$1 $$(ARGS) $$<'
 $$(call make_search,run$1_%)
 nosearch_dbg$1_%: %.py pyston$1 $$(RUN_DEPS)
-	$(VERB) PYTHONPATH=test/test_extension zsh -c 'ulimit -v $$(MAX_DBG_MEM_KB); $$(GDB) $$(GDB_CMDS) --args ./pyston$1 $$(ARGS) $$<'
+	$(VERB) PYTHONPATH=test/test_extension zsh -c 'ulimit -m $$(MAX_DBG_MEM_KB); $$(GDB) $$(GDB_CMDS) --args ./pyston$1 $$(ARGS) $$<'
 $$(call make_search,dbg$1_%)
 
 ifneq ($$(ENABLE_VALGRIND),0)
@@ -1033,7 +1085,7 @@ $(call make_search,runpy_%)
 $(call make_search,pyrun_%)
 $(call make_search,pypyrun_%)
 
-nosearch_check_%: %.py ext_python ext_pyston
+nosearch_check_%: %.py pyston_dbg $(CHECK_DEPS)
 	$(MAKE) check_dbg ARGS="$(patsubst %.py,%,$(notdir $<)) -K"
 $(call make_search,check_%)
 
@@ -1098,7 +1150,7 @@ opreportcg:
 
 .PHONY: watch_% watch wdbg_%
 watch_%:
-	@ ( ulimit -t 60; ulimit -d $(MAK_MEM_KB); ulimit -v $(MAK_MEM_KB); \
+	@ ( ulimit -t 60; ulimit -m $(MAK_MEM_KB); \
 		TARGET=$(dir $@)$(patsubst watch_%,%,$(notdir $@)); \
 		clear; $(MAKE) $$TARGET $(WATCH_ARGS); true; \
 		while inotifywait -q -e modify -e attrib -e move -e move_self -e create -e delete -e delete_self \
@@ -1133,44 +1185,45 @@ test_cpp_ll:
 .PHONY: bench_exceptions
 bench_exceptions:
 	$(CLANGPP_EXE) $(TEST_DIR)/bench_exceptions.cpp -o bench_exceptions -O3 -std=c++11
-	zsh -c 'ulimit -v $(MAX_MEM_KB); ulimit -d $(MAX_MEM_KB); time ./bench_exceptions'
+	zsh -c 'ulimit -m $(MAX_MEM_KB); time ./bench_exceptions'
 	rm bench_exceptions
 
 TEST_EXT_MODULE_NAMES := basic_test descr_test slots_test
+TEST_EXT_MODULE_SRCS := $(TEST_EXT_MODULE_NAMES:%=test/test_extension/%.c)
+TEST_EXT_MODULE_OBJS := $(TEST_EXT_MODULE_NAMES:%=test/test_extension/%.pyston.so)
+
+SHAREDMODS_NAMES := _multiprocessing
+SHAREDMODS_SRCS := \
+	_multiprocessing/multiprocessing.c \
+	_multiprocessing/semaphore.c \
+	_multiprocessing/socket_connection.c
+SHAREDMODS_SRCS := $(SHAREDMODS_SRCS:%=from_cpython/Modules/%)
+SHAREDMODS_OBJS := $(SHAREDMODS_NAMES:%=lib_pyston/%.pyston.so)
+
+.PHONY: sharedmods
+sharedmods: $(SHAREDMODS_OBJS)
 
 .PHONY: ext_pyston
-ext_pyston: $(TEST_EXT_MODULE_NAMES:%=$(TEST_DIR)/test_extension/%.pyston.so)
-ifneq ($(SELF_HOST),1)
-$(TEST_DIR)/test_extension/%.pyston.so: $(TEST_DIR)/test_extension/%.o
-	$(CC) -pthread -shared -Wl,-O1 -Wl,-Bsymbolic-functions -Wl,-z,relro $< -o $@ -g
-$(TEST_DIR)/test_extension/%.o: $(TEST_DIR)/test_extension/%.c $(wildcard from_cpython/Include/*.h)
-	$(CC) -pthread $(EXT_CFLAGS) -c $< -o $@
-else
+ext_pyston: $(TEST_EXT_MODULE_OBJS)
+
 # Hax: we want to generate multiple targets from a single rule, and run the rule only if the
 # dependencies have been updated, and only run it once for all the targets.
 # So just tell make to generate the first extension module, and that the non-first ones just
 # depend on the first one.
-$(TEST_DIR)/test_extension/$(firstword $(TEST_EXT_MODULE_NAMES)).pyston.so: $(TEST_EXT_MODULE_NAMES:%=$(TEST_DIR)/test_extension/%.c) | pyston_dbg
-	$(MAKE) ext_pyston_selfhost
-NONFIRST_EXT := $(wordlist 2,9999,$(TEST_EXT_MODULE_NAMES))
-$(NONFIRST_EXT:%=$(TEST_DIR)/test_extension/%.pyston.so): $(TEST_DIR)/test_extension/$(firstword $(TEST_EXT_MODULE_NAMES)).pyston.so
-endif
-
-.PHONY: ext_pyston_selfhost dbg_ext_pyston_selfhost ext_pyston_selfhost_release
-ext_pyston_selfhost: pyston_dbg $(TEST_EXT_MODULE_NAMES:%=$(TEST_DIR)/test_extension/*.c)
-	cd $(TEST_DIR)/test_extension; DISTUTILS_DEBUG=1 time ../../pyston_dbg setup.py build
-	cd $(TEST_DIR)/test_extension; ln -sf $(TEST_EXT_MODULE_NAMES:%=build/lib.unknown-2.7/%.pyston.so) .
-dbg_ext_pyston_selfhost: pyston_dbg $(TEST_EXT_MODULE_NAMES:%=$(TEST_DIR)/test_extension/*.c)
-	cd $(TEST_DIR)/test_extension; DISTUTILS_DEBUG=1 $(GDB) $(GDB_CMDS) --args ../../pyston_dbg setup.py build
-	cd $(TEST_DIR)/test_extension; ln -sf $(TEST_EXT_MODULE_NAMES:%=build/lib.unknown-2.7/%.pyston.so) .
-ext_pyston_selfhost_release: pyston_release $(TEST_EXT_MODULE_NAMES:%=$(TEST_DIR)/test_extension/*.c)
-	cd $(TEST_DIR)/test_extension; DISTUTILS_DEBUG=1 time ../../pyston_release setup.py build
-	cd $(TEST_DIR)/test_extension; ln -sf $(TEST_EXT_MODULE_NAMES:%=build/lib.unknown-2.7/%.pyston.so) .
+$(firstword $(TEST_EXT_MODULE_OBJS)): $(TEST_EXT_MODULE_SRCS) | pyston_dbg
+	$(VERB) cd $(TEST_DIR)/test_extension; time ../../pyston_dbg setup.py build
+	$(VERB) cd $(TEST_DIR)/test_extension; ln -sf $(TEST_EXT_MODULE_NAMES:%=build/lib.linux2-2.7/%.pyston.so) .
+	$(VERB) touch -c $(TEST_EXT_MODULE_OBJS)
+$(wordlist 2,9999,$(TEST_EXT_MODULE_OBJS)): $(firstword $(TEST_EXT_MODULE_OBJS))
+$(firstword $(SHAREDMODS_OBJS)): $(SHAREDMODS_SRCS) | pyston_dbg
+	$(VERB) cd $(TEST_DIR)/test_extension; time ../../pyston_dbg ../../from_cpython/setup.py build --build-lib ../../lib_pyston
+	$(VERB) touch -c $(SHAREDMODS_OBJS)
+$(wordlist 2,9999,$(SHAREDMODS_OBJS)): $(firstword $(SHAREDMODS_OBJS))
 
 .PHONY: ext_python ext_pythondbg
-ext_python: $(TEST_EXT_MODULE_NAMES:%=$(TEST_DIR)/test_extension/*.c)
+ext_python: $(TEST_EXT_MODULE_SRCS)
 	cd $(TEST_DIR)/test_extension; python setup.py build
-ext_pythondbg: $(TEST_EXT_MODULE_NAMES:%=$(TEST_DIR)/test_extension/*.c)
+ext_pythondbg: $(TEST_EXT_MODULE_SRCS)
 	cd $(TEST_DIR)/test_extension; python2.7-dbg setup.py build
 
 $(FROM_CPYTHON_SRCS:.c=.o): %.o: %.c $(BUILD_SYSTEM_DEPS)

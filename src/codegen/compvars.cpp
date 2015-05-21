@@ -75,9 +75,10 @@ std::string ValuedCompilerType<llvm::Value*>::debugName() {
 }
 
 struct RawInstanceMethod {
-    CompilerVariable* obj, *func;
+    CompilerVariable* obj, *func, *im_class;
 
-    RawInstanceMethod(CompilerVariable* obj, CompilerVariable* func) : obj(obj), func(func) {}
+    RawInstanceMethod(CompilerVariable* obj, CompilerVariable* func, CompilerVariable* im_class)
+        : obj(obj), func(func), im_class(im_class) {}
 };
 
 class InstanceMethodType : public ValuedCompilerType<RawInstanceMethod*> {
@@ -108,9 +109,9 @@ public:
         return rtn;
     }
 
-    static CompilerVariable* makeIM(CompilerVariable* obj, CompilerVariable* func) {
+    static CompilerVariable* makeIM(CompilerVariable* obj, CompilerVariable* func, CompilerVariable* im_class) {
         CompilerVariable* rtn = new ValuedCompilerVariable<RawInstanceMethod*>(
-            InstanceMethodType::get(obj->getType(), func->getType()), new RawInstanceMethod(obj, func), true);
+            InstanceMethodType::get(obj->getType(), func->getType()), new RawInstanceMethod(obj, func, im_class), true);
         obj->incvref();
         func->incvref();
         return rtn;
@@ -160,9 +161,10 @@ public:
         assert(im->func);
         ConcreteCompilerVariable* obj = im->obj->makeConverted(emitter, UNKNOWN);
         ConcreteCompilerVariable* func = im->func->makeConverted(emitter, UNKNOWN);
+        ConcreteCompilerVariable* im_class = im->im_class->makeConverted(emitter, UNKNOWN);
 
-        llvm::Value* boxed
-            = emitter.getBuilder()->CreateCall2(g.funcs.boxInstanceMethod, obj->getValue(), func->getValue());
+        llvm::Value* boxed = emitter.getBuilder()->CreateCall3(g.funcs.boxInstanceMethod, obj->getValue(),
+                                                               func->getValue(), im_class->getValue());
 
         obj->decvref(emitter);
         func->decvref(emitter);
@@ -175,7 +177,8 @@ public:
         CompilerVariable* rtn = cache[var];
         if (rtn == NULL) {
             RawInstanceMethod* im = var->getValue();
-            RawInstanceMethod* new_im = new RawInstanceMethod(im->obj->dup(cache), im->func->dup(cache));
+            RawInstanceMethod* new_im
+                = new RawInstanceMethod(im->obj->dup(cache), im->func->dup(cache), im->im_class->dup(cache));
             rtn = new VAR(this, new_im, var->isGrabbed());
             while (rtn->getVrefs() < var->getVrefs())
                 rtn->incvref();
@@ -720,8 +723,8 @@ ConcreteCompilerVariable* UnknownType::hasnext(IREmitter& emitter, const OpInfo&
     return boolFromI1(emitter, rtn_val);
 }
 
-CompilerVariable* makeFunction(IREmitter& emitter, CLFunction* f, CompilerVariable* closure, bool isGenerator,
-                               Box* globals, const std::vector<ConcreteCompilerVariable*>& defaults) {
+CompilerVariable* makeFunction(IREmitter& emitter, CLFunction* f, CompilerVariable* closure, Box* globals,
+                               const std::vector<ConcreteCompilerVariable*>& defaults) {
     // Unlike the CLFunction*, which can be shared between recompilations, the Box* around it
     // should be created anew every time the functiondef is encountered
 
@@ -749,17 +752,14 @@ CompilerVariable* makeFunction(IREmitter& emitter, CLFunction* f, CompilerVariab
         scratch = getNullPtr(g.llvm_value_type_ptr_ptr);
     }
 
-    llvm::Value* isGenerator_v = llvm::ConstantInt::get(g.i1, isGenerator, false);
-
     assert(globals == NULL);
     llvm::Value* globals_v = getNullPtr(g.llvm_value_type_ptr);
 
     // We know this function call can't throw, so it's safe to use emitter.getBuilder()->CreateCall() rather than
     // emitter.createCall().
     llvm::Value* boxed = emitter.getBuilder()->CreateCall(
-        g.funcs.boxCLFunction,
-        std::vector<llvm::Value*>{ embedRelocatablePtr(f, g.llvm_clfunction_type_ptr), closure_v, isGenerator_v,
-                                   globals_v, scratch, getConstantInt(defaults.size(), g.i64) });
+        g.funcs.boxCLFunction, std::vector<llvm::Value*>{ embedRelocatablePtr(f, g.llvm_clfunction_type_ptr), closure_v,
+                                                          globals_v, scratch, getConstantInt(defaults.size(), g.i64) });
 
     if (convertedClosure)
         convertedClosure->decvref(emitter);
@@ -1476,7 +1476,10 @@ public:
             if (rtattr->cls == function_cls) {
                 CompilerVariable* clattr = new ConcreteCompilerVariable(
                     typeFromClass(function_cls), embedRelocatablePtr(rtattr, g.llvm_value_type_ptr), false);
-                return InstanceMethodType::makeIM(var, clattr);
+
+                return InstanceMethodType::makeIM(
+                    var, clattr,
+                    new ConcreteCompilerVariable(UNKNOWN, embedRelocatablePtr(cls, g.llvm_value_type_ptr), false));
             }
         }
 

@@ -43,7 +43,7 @@ template <> void return_temporary_buffer<pyston::Box*>(pyston::Box** p) {
 namespace pyston {
 namespace gc {
 
-bool _doFree(GCAllocation* al, std::list<Box*, StlCompatAllocator<Box*>>* weakly_referenced);
+bool _doFree(GCAllocation* al, std::vector<Box*>* weakly_referenced);
 
 // lots of linked lists around here, so let's just use template functions for operations on them.
 template <class ListT> inline void nullNextPrev(ListT* node) {
@@ -86,7 +86,7 @@ template <class ListT, typename Func> inline void forEach(ListT* list, Func func
 }
 
 template <class ListT, typename Free>
-inline void sweepList(ListT* head, std::list<Box*, StlCompatAllocator<Box*>>& weakly_referenced, Free free_func) {
+inline void sweepList(ListT* head, std::vector<Box*>& weakly_referenced, Free free_func) {
     auto cur = head;
     while (cur) {
         GCAllocation* al = cur->data;
@@ -95,12 +95,13 @@ inline void sweepList(ListT* head, std::list<Box*, StlCompatAllocator<Box*>>& we
             cur = cur->next;
         } else {
             if (_doFree(al, &weakly_referenced)) {
-
                 removeFromLL(cur);
 
                 auto to_free = cur;
                 cur = cur->next;
                 free_func(to_free);
+            } else {
+                cur = cur->next;
             }
         }
     }
@@ -136,7 +137,7 @@ void registerGCManagedBytes(size_t bytes) {
 
 Heap global_heap;
 
-bool _doFree(GCAllocation* al, std::list<Box*, StlCompatAllocator<Box*>>* weakly_referenced) {
+bool _doFree(GCAllocation* al, std::vector<Box*>* weakly_referenced) {
     if (VERBOSITY() >= 4)
         printf("Freeing %p\n", al->user_data);
 
@@ -185,16 +186,32 @@ struct HeapStatistics {
 
         void print(const char* name) const {
             if (nbytes > (1 << 20))
-                printf("%s: %ld allocations for %.1f MB\n", name, nallocs, nbytes * 1.0 / (1 << 20));
+                fprintf(stderr, "%s: %ld allocations for %.1f MB\n", name, nallocs, nbytes * 1.0 / (1 << 20));
             else if (nbytes > (1 << 10))
-                printf("%s: %ld allocations for %.1f KB\n", name, nallocs, nbytes * 1.0 / (1 << 10));
+                fprintf(stderr, "%s: %ld allocations for %.1f KB\n", name, nallocs, nbytes * 1.0 / (1 << 10));
             else
-                printf("%s: %ld allocations for %ld bytes\n", name, nallocs, nbytes);
+                fprintf(stderr, "%s: %ld allocations for %ld bytes\n", name, nallocs, nbytes);
         }
     };
+
+    bool collect_cls_stats, collect_hcls_stats;
+
+    // For use if collect_cls_stats == true:
     std::unordered_map<BoxedClass*, TypeStats> by_cls;
-    TypeStats conservative, untracked, hcls;
+
+    // For use if collect_hcls_stats == true:
+    std::unordered_map<HiddenClass*, int> hcls_uses;
+#define HCLS_ATTRS_STAT_MAX 20
+    int num_hcls_by_attrs[HCLS_ATTRS_STAT_MAX + 1];
+    int num_hcls_by_attrs_exceed;
+
+    TypeStats python, conservative, untracked, hcls, precise;
     TypeStats total;
+
+    HeapStatistics(bool collect_cls_stats, bool collect_hcls_stats)
+        : collect_cls_stats(collect_cls_stats), collect_hcls_stats(collect_hcls_stats), num_hcls_by_attrs_exceed(0) {
+        memset(num_hcls_by_attrs, 0, sizeof(num_hcls_by_attrs));
+    }
 };
 
 void addStatistic(HeapStatistics* stats, GCAllocation* al, int nbytes) {
@@ -202,11 +219,28 @@ void addStatistic(HeapStatistics* stats, GCAllocation* al, int nbytes) {
     stats->total.nbytes += nbytes;
 
     if (al->kind_id == GCKind::PYTHON) {
-        Box* b = (Box*)al->user_data;
-        auto& t = stats->by_cls[b->cls];
+        stats->python.nallocs++;
+        stats->python.nbytes += nbytes;
 
-        t.nallocs++;
-        t.nbytes += nbytes;
+        if (stats->collect_cls_stats) {
+            Box* b = (Box*)al->user_data;
+            auto& t = stats->by_cls[b->cls];
+
+            t.nallocs++;
+            t.nbytes += nbytes;
+        }
+
+        if (stats->collect_hcls_stats) {
+            Box* b = (Box*)al->user_data;
+            if (b->cls->instancesHaveHCAttrs()) {
+                HCAttrs* attrs = b->getHCAttrsPtr();
+                if (attrs->hcls->attributeArraySize() >= 20) {
+                    printf("%s object has %d attributes\n", b->cls->tp_name, attrs->hcls->attributeArraySize());
+                }
+
+                stats->hcls_uses[attrs->hcls]++;
+            }
+        }
     } else if (al->kind_id == GCKind::CONSERVATIVE) {
         stats->conservative.nallocs++;
         stats->conservative.nbytes += nbytes;
@@ -216,6 +250,18 @@ void addStatistic(HeapStatistics* stats, GCAllocation* al, int nbytes) {
     } else if (al->kind_id == GCKind::HIDDEN_CLASS) {
         stats->hcls.nallocs++;
         stats->hcls.nbytes += nbytes;
+
+        if (stats->collect_hcls_stats) {
+            HiddenClass* hcls = (HiddenClass*)al->user_data;
+            int numattrs = hcls->attributeArraySize();
+            if (numattrs <= HCLS_ATTRS_STAT_MAX)
+                stats->num_hcls_by_attrs[numattrs]++;
+            else
+                stats->num_hcls_by_attrs_exceed++;
+        }
+    } else if (al->kind_id == GCKind::PRECISE) {
+        stats->precise.nallocs++;
+        stats->precise.nbytes += nbytes;
     } else {
         RELEASE_ASSERT(0, "%d", (int)al->kind_id);
     }
@@ -223,27 +269,49 @@ void addStatistic(HeapStatistics* stats, GCAllocation* al, int nbytes) {
 
 
 
-void Heap::dumpHeapStatistics() {
+void Heap::dumpHeapStatistics(int level) {
+    bool collect_cls_stats = (level >= 1);
+    bool collect_hcls_stats = (level >= 1);
+
     threading::GLPromoteRegion _lock;
 
-    HeapStatistics stats;
+    fprintf(stderr, "\nCollecting heap stats for pid %d...\n", getpid());
+
+    HeapStatistics stats(collect_cls_stats, collect_hcls_stats);
 
     small_arena.getStatistics(&stats);
     large_arena.getStatistics(&stats);
     huge_arena.getStatistics(&stats);
 
+    stats.python.print("python");
     stats.conservative.print("conservative");
     stats.untracked.print("untracked");
     stats.hcls.print("hcls");
-    for (const auto& p : stats.by_cls) {
-        p.second.print(getFullNameOfClass(p.first).c_str());
+    stats.precise.print("precise");
+
+    if (collect_cls_stats) {
+        for (const auto& p : stats.by_cls) {
+            p.second.print(getFullNameOfClass(p.first).c_str());
+        }
     }
+
     stats.total.print("Total");
-    printf("\n");
+
+    if (collect_hcls_stats) {
+        fprintf(stderr, "%ld hidden classes currently alive\n", stats.hcls.nallocs);
+        fprintf(stderr, "%ld have at least one Box that uses them\n", stats.hcls_uses.size());
+
+        for (int i = 0; i <= HCLS_ATTRS_STAT_MAX; i++) {
+            fprintf(stderr, "With % 3d attributes: %d\n", i, stats.num_hcls_by_attrs[i]);
+        }
+        fprintf(stderr, "With >% 2d attributes: %d\n", HCLS_ATTRS_STAT_MAX, stats.num_hcls_by_attrs_exceed);
+    }
+
+    fprintf(stderr, "\n");
 }
 
-void dumpHeapStatistics() {
-    global_heap.dumpHeapStatistics();
+void dumpHeapStatistics(int level) {
+    global_heap.dumpHeapStatistics(level);
 }
 
 //////
@@ -303,7 +371,7 @@ GCAllocation* SmallArena::allocationFrom(void* ptr) {
     return reinterpret_cast<GCAllocation*>(&b->atoms[atom_idx]);
 }
 
-void SmallArena::freeUnmarked(std::list<Box*, StlCompatAllocator<Box*>>& weakly_referenced) {
+void SmallArena::freeUnmarked(std::vector<Box*>& weakly_referenced) {
     thread_caches.forEachValue([this, &weakly_referenced](ThreadBlockCache* cache) {
         for (int bidx = 0; bidx < NUM_BUCKETS; bidx++) {
             Block* h = cache->cache_free_heads[bidx];
@@ -363,7 +431,7 @@ void SmallArena::getStatistics(HeapStatistics* stats) {
 }
 
 
-SmallArena::Block** SmallArena::_freeChain(Block** head, std::list<Box*, StlCompatAllocator<Box*>>& weakly_referenced) {
+SmallArena::Block** SmallArena::_freeChain(Block** head, std::vector<Box*>& weakly_referenced) {
     while (Block* b = *head) {
         int num_objects = b->numObjects();
         int first_obj = b->minObjIndex();
@@ -381,8 +449,10 @@ SmallArena::Block** SmallArena::_freeChain(Block** head, std::list<Box*, StlComp
             if (isMarked(al)) {
                 clearMark(al);
             } else {
-                if (_doFree(al, &weakly_referenced))
+                if (_doFree(al, &weakly_referenced)) {
                     b->isfree.set(atom_idx);
+                    // memset(al->user_data, 0, b->size - sizeof(GCAllocation));
+                }
             }
         }
 
@@ -588,7 +658,7 @@ GCAllocation* LargeArena::allocationFrom(void* ptr) {
     return NULL;
 }
 
-void LargeArena::freeUnmarked(std::list<Box*, StlCompatAllocator<Box*>>& weakly_referenced) {
+void LargeArena::freeUnmarked(std::vector<Box*>& weakly_referenced) {
     sweepList(head, weakly_referenced, [this](LargeObj* ptr) { _freeLargeObj(ptr); });
 }
 
@@ -780,7 +850,7 @@ GCAllocation* HugeArena::allocationFrom(void* ptr) {
     return NULL;
 }
 
-void HugeArena::freeUnmarked(std::list<Box*, StlCompatAllocator<Box*>>& weakly_referenced) {
+void HugeArena::freeUnmarked(std::vector<Box*>& weakly_referenced) {
     sweepList(head, weakly_referenced, [this](HugeObj* ptr) { _freeHugeObj(ptr); });
 }
 

@@ -14,13 +14,13 @@ sudo add-apt-repository --yes ppa:ubuntu-toolchain-r/test
 sudo add-apt-repository --yes ppa:kubuntu-ppa/backports
 sudo apt-get -qq update
 
-sudo apt-get install -yq git cmake ninja-build ccache libncurses5-dev liblzma-dev libreadline-dev libgmp3-dev autoconf libtool python-dev texlive-extra-utils clang-3.4 libstdc++-4.8-dev libssl-dev libsqlite3-dev
+sudo apt-get install -yq git cmake ninja-build ccache libncurses5-dev liblzma-dev libreadline-dev libgmp3-dev autoconf libtool python-dev texlive-extra-utils clang-3.4 libstdc++-4.8-dev libssl-dev libsqlite3-dev pkg-config
 ```
 
 
 **Ubuntu 14.04**
 ```
-sudo apt-get install -yq git cmake ninja-build ccache libncurses5-dev liblzma-dev libreadline-dev libgmp3-dev autoconf libtool python-dev texlive-extra-utils clang-3.4 libssl-dev libsqlite3-dev
+sudo apt-get install -yq git cmake ninja-build ccache libncurses5-dev liblzma-dev libreadline-dev libgmp3-dev autoconf libtool python-dev texlive-extra-utils clang-3.4 libssl-dev libsqlite3-dev pkg-config
 ```
 
 ### Building and testing
@@ -34,6 +34,7 @@ git config --global user.email "you@example.com"
 git config --global user.name "Your Name"
 
 cd ~/pyston
+make llvm_up
 make
 make check
 ```

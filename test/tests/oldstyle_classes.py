@@ -55,6 +55,14 @@ class E():
             print "f", a
         return f
 
+    def __eq__(self, other):
+        print "eq"
+        return self.n == other.n
+
+    def __ne__(self, other):
+        print "ne"
+        return self.n != other.n
+
 e = E(1)
 print e
 print e.n
@@ -63,6 +71,8 @@ print e[1]
 print e[1:2]
 print len(e)
 print e()("test")
+print e == E(1)
+print e != E(1)
 
 def str2():
     return "str2"
@@ -82,6 +92,8 @@ class F:
 
 print bool(F(0))
 print bool(F(1))
+print F(0) == F(0)
+print F(0) != F(0)
 
 f = F(0)
 try:
@@ -135,9 +147,13 @@ class SetattrTest:
     def __setattr__(self, attr, value):
         print "setattr", attr, value
 
+    def __delattr__(self, attr):
+        print "delattr", attr
+
 s = SetattrTest()
 s.b = 2
-print g.__dict__.items()
+print s.__dict__.items()
+del s.b
 
 class MappingTest:
     def __getitem__(self, key):
@@ -233,3 +249,53 @@ class E(C, object):
 print issubclass(D, C), isinstance(D(), C)
 print issubclass(E, C), isinstance(E(), C)
 print isinstance(E, object), isinstance(E(), object)
+
+class SeqTest:
+    class Iterator:
+        def __init__(self):
+            self.n = 5
+        def next(self):
+            print "next"
+            if self.n <= 0:
+                raise StopIteration()
+            r = self.n
+            self.n -= 1
+            return r
+    def __iter__(self):
+        print "iter"
+        return SeqTest.Iterator()
+m = SeqTest()
+print list(m)
+
+class OldSeqTest:
+    def __getitem__(self, n):
+        print "getitem", n
+        if n > 5:
+            raise IndexError()
+        return n ** 2
+m = OldSeqTest()
+print list(m)
+
+import sys
+class E:
+    def __init__(self, *args):
+        print "__init__", args
+    def __repr__(self):
+        return "<E object>"
+try:
+    raise E
+except:
+    print sys.exc_info()[0].__name__, sys.exc_info()[1]
+try:
+    raise E, 1
+except:
+    print sys.exc_info()[0].__name__, sys.exc_info()[1]
+try:
+    raise E()
+except:
+    print sys.exc_info()[0].__name__, sys.exc_info()[1]
+try:
+    raise E(), 1
+except:
+    print sys.exc_info()[0].__name__, sys.exc_info()[1]
+

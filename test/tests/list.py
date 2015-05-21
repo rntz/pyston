@@ -4,6 +4,7 @@ print l * 5
 l[0] = 1
 print l
 print l[2]
+print l[2L]
 
 l = range(5)
 while l:
@@ -21,6 +22,7 @@ for i in xrange(-10, 10):
 for i in xrange(-5, 4):
     l3 = range(5)
     print i, l3.pop(i), l3
+print range(5).pop(2L)
 
 for i in xrange(-5, 4):
     l3 = range(5)
@@ -123,7 +125,13 @@ for i in xrange(3):
             l[j:k] = ["added"]
             print i, j, k, l
 
-
+def G():
+    yield "a"
+    yield "b"
+    yield "c"
+l = [0, 1, 2, 3, 4, 5]
+l[1:] = G()
+print l
 
 l = [1, 3, 5, 7, 2, 4]
 print l.sort(key=lambda x:x%3)
@@ -194,3 +202,5 @@ l.sort(cmp=mycmp, key=str)
 print types_seen
 print l
 """
+
+print repr(list.__hash__)

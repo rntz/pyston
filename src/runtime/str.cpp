@@ -36,6 +36,7 @@
 #include "runtime/util.h"
 
 extern "C" PyObject* string_count(PyStringObject* self, PyObject* args) noexcept;
+extern "C" PyObject* string_join(PyStringObject* self, PyObject* orig) noexcept;
 extern "C" PyObject* string_split(PyStringObject* self, PyObject* args) noexcept;
 extern "C" PyObject* string_rsplit(PyStringObject* self, PyObject* args) noexcept;
 extern "C" PyObject* string_find(PyStringObject* self, PyObject* args) noexcept;
@@ -51,7 +52,7 @@ extern "C" PyObject* string_splitlines(PyStringObject* self, PyObject* args) noe
 
 namespace pyston {
 
-BoxedString::BoxedString(const char* s, size_t n) : s(storage(), n) {
+BoxedString::BoxedString(const char* s, size_t n) : s(storage(), n), interned_state(SSTATE_NOT_INTERNED) {
     RELEASE_ASSERT(n != llvm::StringRef::npos, "");
     if (s) {
         memmove(data(), s, n);
@@ -61,20 +62,21 @@ BoxedString::BoxedString(const char* s, size_t n) : s(storage(), n) {
     }
 }
 
-BoxedString::BoxedString(llvm::StringRef lhs, llvm::StringRef rhs) : s(storage(), lhs.size() + rhs.size()) {
+BoxedString::BoxedString(llvm::StringRef lhs, llvm::StringRef rhs)
+    : s(storage(), lhs.size() + rhs.size()), interned_state(SSTATE_NOT_INTERNED) {
     RELEASE_ASSERT(lhs.size() + rhs.size() != llvm::StringRef::npos, "");
     memmove(data(), lhs.data(), lhs.size());
     memmove(data() + lhs.size(), rhs.data(), rhs.size());
     data()[lhs.size() + rhs.size()] = 0;
 }
 
-BoxedString::BoxedString(llvm::StringRef s) : s(storage(), s.size()) {
+BoxedString::BoxedString(llvm::StringRef s) : s(storage(), s.size()), interned_state(SSTATE_NOT_INTERNED) {
     RELEASE_ASSERT(s.size() != llvm::StringRef::npos, "");
     memmove(data(), s.data(), s.size());
     data()[s.size()] = 0;
 }
 
-BoxedString::BoxedString(size_t n, char c) : s(storage(), n) {
+BoxedString::BoxedString(size_t n, char c) : s(storage(), n), interned_state(SSTATE_NOT_INTERNED) {
     RELEASE_ASSERT(n != llvm::StringRef::npos, "");
     memset(data(), c, n);
     data()[n] = 0;
@@ -344,23 +346,44 @@ extern "C" Box* strAdd(BoxedString* lhs, Box* _rhs) {
 }
 
 static llvm::StringMap<Box*> interned_strings;
-
 extern "C" PyObject* PyString_InternFromString(const char* s) noexcept {
     RELEASE_ASSERT(s, "");
-    auto it = interned_strings.find(s);
-    if (it == interned_strings.end()) {
-        Box* b = PyGC_AddRoot(boxString(s));
-        assert(b);
-        interned_strings[s] = b;
-        return b;
-    } else {
-        assert(it->second);
-        return it->second;
+    auto& entry = interned_strings[s];
+    if (!entry) {
+        entry = PyGC_AddRoot(boxString(s));
+        // CPython returns mortal but in our current implementation they are inmortal
+        ((BoxedString*)entry)->interned_state = SSTATE_INTERNED_IMMORTAL;
+    }
+    return entry;
+}
+
+extern "C" void PyString_InternInPlace(PyObject** p) noexcept {
+    BoxedString* s = (BoxedString*)*p;
+    if (s == NULL || !PyString_Check(s))
+        Py_FatalError("PyString_InternInPlace: strings only please!");
+    /* If it's a string subclass, we don't really know what putting
+       it in the interned dict might do. */
+    if (!PyString_CheckExact(s))
+        return;
+
+    if (PyString_CHECK_INTERNED(s))
+        return;
+
+    auto& entry = interned_strings[s->s];
+    if (entry)
+        *p = entry;
+    else {
+        entry = PyGC_AddRoot(s);
+
+        // CPython returns mortal but in our current implementation they are inmortal
+        s->interned_state = SSTATE_INTERNED_IMMORTAL;
     }
 }
 
-extern "C" void PyString_InternInPlace(PyObject** o) noexcept {
-    Py_FatalError("unimplemented");
+extern "C" int _PyString_CheckInterned(PyObject* p) noexcept {
+    RELEASE_ASSERT(PyString_Check(p), "");
+    BoxedString* s = (BoxedString*)p;
+    return s->interned_state;
 }
 
 /* Format codes
@@ -1111,6 +1134,7 @@ extern "C" Box* strMod(BoxedString* lhs, Box* rhs) {
 }
 
 extern "C" Box* strMul(BoxedString* lhs, Box* rhs) {
+    STAT_TIMER(t0, "us_timer_strMul");
     assert(isSubclass(lhs->cls, str_cls));
 
     int n;
@@ -1513,6 +1537,7 @@ failed:
 }
 
 extern "C" size_t unicodeHashUnboxed(PyUnicodeObject* self) {
+    STAT_TIMER(t0, "us_timer_unicodeHashUnboxed");
     if (self->hash != -1)
         return self->hash;
 
@@ -1523,6 +1548,7 @@ extern "C" size_t unicodeHashUnboxed(PyUnicodeObject* self) {
 }
 
 extern "C" Box* strHash(BoxedString* self) {
+    STAT_TIMER(t0, "us_timer_strHash");
     assert(isSubclass(self->cls, str_cls));
 
     StringHash<char> H;
@@ -1711,76 +1737,9 @@ Box* strIsTitle(BoxedString* self) {
     return boxBool(cased);
 }
 
-Box* strJoin(BoxedString* self, Box* rhs) {
-    assert(isSubclass(self->cls, str_cls));
-
-    int i = 0;
-    if (rhs->cls == str_cls) {
-        BoxedString* srhs = static_cast<BoxedString*>(rhs);
-        if (srhs->size() == 0)
-            return EmptyString;
-
-        size_t rtn_len = self->size() * (srhs->size() - 1) + srhs->size();
-        BoxedString* rtn = new (rtn_len) BoxedString(nullptr, rtn_len);
-        char* p = rtn->data();
-        for (auto c : srhs->s) {
-            if (i > 0) {
-                memmove(p, self->data(), self->size());
-                p += self->size();
-            }
-            *p++ = c;
-            ++i;
-        }
-        return rtn;
-    } else if (rhs->cls == list_cls) {
-        BoxedList* lrhs = static_cast<BoxedList*>(rhs);
-        if (lrhs->size == 0)
-            return EmptyString;
-
-        size_t rtn_len = self->size() * (lrhs->size - 1);
-
-        for (int l = 0; l < lrhs->size; l++) {
-            // if we hit anything but a string (unicode objects can be here), bail out since we're
-            // going to pay the cost of converting the unicode to string objects anyway.
-            if (lrhs->elts->elts[l]->cls != str_cls)
-                goto fallback;
-            rtn_len += static_cast<BoxedString*>(lrhs->elts->elts[l])->size();
-        }
-        BoxedString* rtn = new (rtn_len) BoxedString(nullptr, rtn_len);
-        char* p = rtn->data();
-        for (i = 0; i < lrhs->size; i++) {
-            if (i > 0) {
-                memmove(p, self->data(), self->size());
-                p += self->size();
-            }
-            auto lrhs_el = static_cast<BoxedString*>(lrhs->elts->elts[i]);
-            memmove(p, lrhs_el->data(), lrhs_el->size());
-            p += lrhs_el->size();
-        }
-        return rtn;
-    }
-
-fallback:
-    std::string output_str;
-    llvm::raw_string_ostream os(output_str);
-    for (Box* e : rhs->pyElements()) {
-        if (i > 0)
-            os << self->s;
-        os << str(e)->s;
-        ++i;
-    }
-    os.flush();
-    return boxString(std::move(output_str));
-}
-
 extern "C" PyObject* _PyString_Join(PyObject* sep, PyObject* x) noexcept {
-    try {
-        RELEASE_ASSERT(isSubclass(sep->cls, str_cls), "");
-        return strJoin((BoxedString*)sep, x);
-    } catch (ExcInfo e) {
-        setCAPIException(e);
-        return NULL;
-    }
+    RELEASE_ASSERT(isSubclass(sep->cls, str_cls), "");
+    return string_join((PyStringObject*)sep, x);
 }
 
 Box* strReplace(Box* _self, Box* _old, Box* _new, Box** _args) {
@@ -2240,9 +2199,10 @@ Box* strEncode(BoxedString* self, Box* encoding, Box* error) {
 extern "C" Box* strGetitem(BoxedString* self, Box* slice) {
     assert(isSubclass(self->cls, str_cls));
 
-    if (isSubclass(slice->cls, int_cls)) {
-        BoxedInt* islice = static_cast<BoxedInt*>(slice);
-        int64_t n = islice->n;
+    if (PyIndex_Check(slice)) {
+        Py_ssize_t n = PyNumber_AsSsize_t(slice, PyExc_IndexError);
+        if (n == -1 && PyErr_Occurred())
+            throwCAPIException();
         int size = self->size();
         if (n < 0)
             n = size + n;
@@ -2367,8 +2327,17 @@ extern "C" PyObject* PyString_FromStringAndSize(const char* s, ssize_t n) noexce
     return boxStrConstantSize(s, n);
 }
 
+static /*const*/ char* string_getbuffer(register PyObject* op) noexcept {
+    char* s;
+    Py_ssize_t len;
+    if (PyString_AsStringAndSize(op, &s, &len))
+        return NULL;
+    return s;
+}
+
 extern "C" char* PyString_AsString(PyObject* o) noexcept {
-    RELEASE_ASSERT(isSubclass(o->cls, str_cls), "");
+    if (!PyString_Check(o))
+        return string_getbuffer(o);
 
     BoxedString* s = static_cast<BoxedString*>(o);
     return getWriteableStringContents(s);
@@ -2394,6 +2363,11 @@ extern "C" int _PyString_Resize(PyObject** pv, Py_ssize_t newsize) noexcept {
 
     if (newsize == s->size())
         return 0;
+
+    if (PyString_CHECK_INTERNED(s)) {
+        *pv = 0;
+        return -1;
+    }
 
     if (newsize < s->size()) {
         // XXX resize the box (by reallocating) smaller if it makes sense
@@ -2669,6 +2643,7 @@ static PyBufferProcs string_as_buffer = {
 
 static PyMethodDef string_methods[] = {
     { "count", (PyCFunction)string_count, METH_VARARGS, NULL },
+    { "join", (PyCFunction)string_join, METH_O, NULL },
     { "split", (PyCFunction)string_split, METH_VARARGS, NULL },
     { "rsplit", (PyCFunction)string_rsplit, METH_VARARGS, NULL },
     { "find", (PyCFunction)string_find, METH_VARARGS, NULL },
@@ -2768,8 +2743,6 @@ void setupStr() {
     str_cls->giveAttr("__getitem__", new BoxedFunction(boxRTFunction((void*)strGetitem, STR, 2)));
 
     str_cls->giveAttr("__iter__", new BoxedFunction(boxRTFunction((void*)strIter, typeFromClass(str_iterator_cls), 1)));
-
-    str_cls->giveAttr("join", new BoxedFunction(boxRTFunction((void*)strJoin, STR, 2)));
 
     str_cls->giveAttr("replace",
                       new BoxedFunction(boxRTFunction((void*)strReplace, UNKNOWN, 4, 1, false, false), { boxInt(-1) }));

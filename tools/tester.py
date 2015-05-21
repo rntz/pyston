@@ -59,7 +59,7 @@ def set_ulimits():
     MAX_MEM_MB = 100
     resource.setrlimit(resource.RLIMIT_RSS, (MAX_MEM_MB * 1024 * 1024, MAX_MEM_MB * 1024 * 1024))
 
-EXTMODULE_DIR = os.path.abspath(os.path.dirname(os.path.realpath(__file__)) + "/../test/test_extension/build/lib.linux-x86_64-2.7/")
+EXTMODULE_DIR = None
 EXTMODULE_DIR_PYSTON = None
 THIS_FILE = os.path.abspath(__file__)
 
@@ -72,6 +72,7 @@ def get_global_mtime():
     # Start off by depending on the tester itself
     rtn = os.stat(THIS_FILE).st_mtime
 
+    assert os.listdir(EXTMODULE_DIR), EXTMODULE_DIR
     for fn in os.listdir(EXTMODULE_DIR):
         if not fn.endswith(".so"):
             continue
@@ -157,6 +158,9 @@ def run_test(fn, check_stats, run_memcheck):
     code = p.wait()
     elapsed = time.time() - start
 
+    if code >= 128:
+        code -= 256
+
     return determine_test_result(fn, opts, code, out, stderr, elapsed)
 
 def get_test_options(fn, check_stats, run_memcheck):
@@ -222,8 +226,6 @@ def get_test_options(fn, check_stats, run_memcheck):
     return opts
 
 def determine_test_result(fn, opts, code, out, stderr, elapsed):
-    last_stderr_line = stderr.strip().split('\n')[-1]
-
     if opts.allow_warnings:
         out_lines = []
         for l in out.split('\n'):
@@ -235,13 +237,26 @@ def determine_test_result(fn, opts, code, out, stderr, elapsed):
         out = "\n".join(out_lines)
 
     stats = None
-    if code >= 0 and opts.collect_stats:
+    if opts.collect_stats:
         stats = {}
-        assert out.count("Stats:") == 1
-        out, stats_str = out.split("Stats:")
-        for l in stats_str.strip().split('\n'):
-            k, v = l.split(':')
-            stats[k.strip()] = int(v)
+        have_stats = (stderr.count("Stats:") == 1 and stderr.count("(End of stats)") == 1)
+
+        if code >= 0:
+            assert have_stats
+
+        if have_stats:
+            assert stderr.count("Stats:") == 1
+            stderr, stats_str = stderr.split("Stats:")
+            stats_str, stderr_tail = stats_str.split("(End of stats)\n")
+            stderr += stderr_tail
+
+            other_stats_str, counter_str = stats_str.split("Counters:")
+            for l in counter_str.strip().split('\n'):
+                assert l.count(':') == 1, l
+                k, v = l.split(':')
+                stats[k.strip()] = int(v)
+
+    last_stderr_line = stderr.strip().split('\n')[-1]
 
     if EXIT_CODE_ONLY:
         # fools the rest of this function into thinking the output is OK & just checking the exit code.
@@ -430,6 +445,8 @@ parser.add_argument('-e', '--exit-code-only', action='store_true',
                     help="only check exit code; don't run CPython to get expected output to compare against")
 parser.add_argument('--skip-failing', action='store_true',
                     help="skip tests expected to fail")
+parser.add_argument('--order-by-mtime', action='store_true',
+                    help="order test execution by modification time, instead of file size")
 
 parser.add_argument('test_dir')
 parser.add_argument('pattern', nargs='*')
@@ -446,6 +463,7 @@ def main(orig_dir):
     global SKIP_FAILING_TESTS
     global VERBOSE
     global EXTMODULE_DIR_PYSTON
+    global EXTMODULE_DIR
 
     run_memcheck = False
 
@@ -463,6 +481,7 @@ def main(orig_dir):
 
     TEST_DIR = os.path.join(orig_dir, opts.test_dir)
     EXTMODULE_DIR_PYSTON = os.path.abspath(os.path.dirname(os.path.realpath(IMAGE)) + "/test/test_extension/")
+    EXTMODULE_DIR = os.path.abspath(os.path.dirname(os.path.realpath(IMAGE)) + "/test/test_extension/build/lib.linux-x86_64-2.7/")
     patterns = opts.pattern
 
     if not patterns and not TESTS_TO_SKIP:
@@ -506,7 +525,10 @@ def main(orig_dir):
         IMAGE = '/usr/local/bin/pypy'
 
     if not patterns:
-        tests.sort(key=fileSize)
+        if opts.order_by_mtime:
+            tests.sort(key=lambda fn:os.stat(fn).st_mtime, reverse=True)
+        else:
+            tests.sort(key=fileSize)
 
     for fn in tests:
         check_stats = fn not in IGNORE_STATS

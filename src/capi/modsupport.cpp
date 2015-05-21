@@ -404,7 +404,7 @@ extern "C" PyObject* Py_InitModule4(const char* name, PyMethodDef* methods, cons
         }
     }
 
-    BoxedModule* module = createModule(name, "__builtin__", doc);
+    BoxedModule* module = createModule(name, NULL, doc);
 
     // Pass self as is, even if NULL we are not allowed to change it to None
     Box* passthrough = static_cast<Box*>(self);
@@ -412,8 +412,8 @@ extern "C" PyObject* Py_InitModule4(const char* name, PyMethodDef* methods, cons
     while (methods && methods->ml_name) {
         RELEASE_ASSERT((methods->ml_flags & (~(METH_VARARGS | METH_KEYWORDS | METH_NOARGS | METH_O))) == 0, "%d",
                        methods->ml_flags);
-        module->giveAttr(methods->ml_name,
-                         new BoxedCApiFunction(methods->ml_flags, passthrough, methods->ml_name, methods->ml_meth));
+        module->giveAttr(methods->ml_name, new BoxedCApiFunction(methods->ml_flags, passthrough, methods->ml_name,
+                                                                 methods->ml_meth, boxString(name)));
 
         methods++;
     }
@@ -425,7 +425,7 @@ extern "C" PyObject* PyModule_GetDict(PyObject* _m) noexcept {
     BoxedModule* m = static_cast<BoxedModule*>(_m);
     assert(m->cls == module_cls);
 
-    return makeAttrWrapper(m);
+    return m->getAttrWrapper();
 }
 
 extern "C" int PyModule_AddObject(PyObject* _m, const char* name, PyObject* value) noexcept {

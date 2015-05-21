@@ -363,6 +363,16 @@ public:
         abort();
     }
 
+    Box* getGlobalsDict() {
+        Box* globals = getGlobals();
+        if (!globals)
+            return NULL;
+
+        if (isSubclass(globals->cls, module_cls))
+            return globals->getAttrWrapper();
+        return globals;
+    }
+
     FrameInfo* getFrameInfo() {
         if (id.type == PythonFrameId::COMPILED) {
             CompiledFunction* cf = getCF();
@@ -501,6 +511,7 @@ void unwindPythonStack(std::function<bool(std::unique_ptr<PythonFrameIteratorImp
 }
 
 static std::unique_ptr<PythonFrameIteratorImpl> getTopPythonFrame() {
+    STAT_TIMER(t0, "us_timer_getTopPythonFrame");
     std::unique_ptr<PythonFrameIteratorImpl> rtn(nullptr);
     unwindPythonStack([&](std::unique_ptr<PythonFrameIteratorImpl> iter) {
         rtn = std::move(iter);
@@ -551,11 +562,21 @@ static const LineInfo* lineInfoForFrame(PythonFrameIteratorImpl& frame_it) {
 //
 static StatCounter us_gettraceback("us_gettraceback");
 BoxedTraceback* getTraceback() {
+    STAT_TIMER(t0, "us_timer_gettraceback");
     if (!ENABLE_FRAME_INTROSPECTION) {
         static bool printed_warning = false;
         if (!printed_warning) {
             printed_warning = true;
             fprintf(stderr, "Warning: can't get traceback since ENABLE_FRAME_INTROSPECTION=0\n");
+        }
+        return new BoxedTraceback();
+    }
+
+    if (!ENABLE_TRACEBACKS) {
+        static bool printed_warning = false;
+        if (!printed_warning) {
+            printed_warning = true;
+            fprintf(stderr, "Warning: can't get traceback since ENABLE_TRACEBACKS=0\n");
         }
         return new BoxedTraceback();
     }
@@ -625,17 +646,13 @@ CompiledFunction* getTopCompiledFunction() {
 
 Box* getGlobals() {
     auto it = getTopPythonFrame();
+    if (!it)
+        return NULL;
     return it->getGlobals();
 }
 
 Box* getGlobalsDict() {
-    Box* globals = getGlobals();
-    if (!globals)
-        return NULL;
-
-    if (isSubclass(globals->cls, module_cls))
-        return makeAttrWrapper(globals);
-    return globals;
+    return getTopPythonFrame()->getGlobalsDict();
 }
 
 BoxedModule* getCurrentModule() {
@@ -773,7 +790,7 @@ Box* PythonFrameIterator::fastLocalsToBoxedLocals() {
         // TODO we should cache this in frame_info->locals or something so that locals()
         // (and globals() too) will always return the same dict
         RELEASE_ASSERT(cf->clfunc->source->scoping->areGlobalsFromModule(), "");
-        return makeAttrWrapper(cf->clfunc->source->parent_module);
+        return cf->clfunc->source->parent_module->getAttrWrapper();
     }
 
     if (impl->getId().type == PythonFrameId::COMPILED) {
@@ -928,6 +945,10 @@ CompiledFunction* PythonFrameIterator::getCF() {
     return impl->getCF();
 }
 
+Box* PythonFrameIterator::getGlobalsDict() {
+    return impl->getGlobalsDict();
+}
+
 FrameInfo* PythonFrameIterator::getFrameInfo() {
     return impl->getFrameInfo();
 }
@@ -942,6 +963,29 @@ PythonFrameIterator PythonFrameIterator::getCurrentVersion() {
         }
         return false;
     });
+    return PythonFrameIterator(std::move(rtn));
+}
+
+PythonFrameIterator PythonFrameIterator::back() {
+    // TODO this is ineffecient: the iterator is no longer valid for libunwind iteration, so
+    // we have to do a full stack crawl again.
+    // Hopefully examination of f_back is uncommon.
+
+    std::unique_ptr<PythonFrameIteratorImpl> rtn(nullptr);
+    auto& impl = this->impl;
+    bool found = false;
+    unwindPythonStack([&](std::unique_ptr<PythonFrameIteratorImpl> frame_iter) {
+        if (found) {
+            rtn = std::move(frame_iter);
+            return true;
+        }
+
+        if (frame_iter->pointsToTheSameAs(*impl.get()))
+            found = true;
+        return false;
+    });
+
+    RELEASE_ASSERT(found, "this wasn't a valid frame?");
     return PythonFrameIterator(std::move(rtn));
 }
 

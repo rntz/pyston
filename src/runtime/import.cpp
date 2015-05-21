@@ -21,6 +21,7 @@
 
 #include "codegen/irgen/hooks.h"
 #include "codegen/parser.h"
+#include "codegen/unwinding.h"
 #include "runtime/capi.h"
 #include "runtime/objmodel.h"
 
@@ -38,8 +39,8 @@ static void removeModule(const std::string& name) {
     d->d.erase(b_name);
 }
 
-BoxedModule* createAndRunModule(const std::string& name, const std::string& fn) {
-    BoxedModule* module = createModule(name, fn);
+Box* createAndRunModule(const std::string& name, const std::string& fn) {
+    BoxedModule* module = createModule(name, fn.c_str());
 
     AST_Module* ast = caching_parse_file(fn.c_str());
     try {
@@ -48,11 +49,15 @@ BoxedModule* createAndRunModule(const std::string& name, const std::string& fn) 
         removeModule(name);
         raiseRaw(e);
     }
-    return module;
+
+    Box* r = getSysModulesDict()->getOrNull(boxString(name));
+    if (!r)
+        raiseExcHelper(ImportError, "Loaded module %.200s not found in sys.modules", name.c_str());
+    return r;
 }
 
-static BoxedModule* createAndRunModule(const std::string& name, const std::string& fn, const std::string& module_path) {
-    BoxedModule* module = createModule(name, fn);
+static Box* createAndRunModule(const std::string& name, const std::string& fn, const std::string& module_path) {
+    BoxedModule* module = createModule(name, fn.c_str());
 
     Box* b_path = boxStringPtr(&module_path);
 
@@ -68,7 +73,11 @@ static BoxedModule* createAndRunModule(const std::string& name, const std::strin
         removeModule(name);
         raiseRaw(e);
     }
-    return module;
+
+    Box* r = getSysModulesDict()->getOrNull(boxString(name));
+    if (!r)
+        raiseExcHelper(ImportError, "Loaded module %.200s not found in sys.modules", name.c_str());
+    return r;
 }
 
 #if LLVMREV < 210072
@@ -222,10 +231,9 @@ SearchResult findModule(const std::string& name, const std::string& full_name, B
             return SearchResult("", SearchResult::SEARCH_ERROR);
 
         if (importer != None) {
-            auto path_pass = path_list ? path_list : None;
             Box* loader = callattr(importer, &find_module_str,
-                                   CallattrFlags({.cls_only = false, .null_on_nonexistent = false }), ArgPassSpec(2),
-                                   boxString(full_name), path_pass, NULL, NULL, NULL);
+                                   CallattrFlags({.cls_only = false, .null_on_nonexistent = false }), ArgPassSpec(1),
+                                   boxString(full_name), NULL, NULL, NULL, NULL);
             if (loader != None)
                 return SearchResult(loader);
         }
@@ -267,7 +275,7 @@ static Box* getParent(Box* globals, int level, std::string& buf) {
     if (globals == NULL || globals == None || level == 0)
         return None;
 
-    BoxedString* pkgname = static_cast<BoxedString*>(getattrInternal(globals, package_str, NULL));
+    BoxedString* pkgname = static_cast<BoxedString*>(getFromGlobals(globals, package_str));
     if (pkgname != NULL && pkgname != None) {
         /* __package__ is set, so use it */
         if (pkgname->cls != str_cls) {
@@ -286,17 +294,11 @@ static Box* getParent(Box* globals, int level, std::string& buf) {
         buf += pkgname->s;
     } else {
         /* __package__ not set, so figure it out and set it */
-        BoxedString* modname = static_cast<BoxedString*>(getattrInternal(globals, name_str, NULL));
+        BoxedString* modname = static_cast<BoxedString*>(getFromGlobals(globals, name_str));
         if (modname == NULL || modname->cls != str_cls)
             return None;
 
-        Box* modpath = NULL;
-        try {
-            modpath = getattrInternal(globals, path_str, NULL);
-        } catch (ExcInfo e) {
-            if (!e.matches(AttributeError))
-                raiseRaw(e);
-        }
+        Box* modpath = getFromGlobals(globals, path_str);
 
         if (modpath != NULL) {
             /* __path__ is set, so modname is already the package name */
@@ -304,7 +306,7 @@ static Box* getParent(Box* globals, int level, std::string& buf) {
                 raiseExcHelper(ValueError, "Module name too long");
             }
             buf += modname->s;
-            globals->setattr(package_str, modname, NULL);
+            setGlobal(globals, package_str, modname);
         } else {
             /* Normal module, so work out the package name if any */
             size_t lastdot = modname->s.rfind('.');
@@ -312,7 +314,7 @@ static Box* getParent(Box* globals, int level, std::string& buf) {
                 raiseExcHelper(ValueError, "Attempted relative import in non-package");
             }
             if (lastdot == std::string::npos) {
-                globals->setattr(package_str, None, NULL);
+                setGlobal(globals, package_str, None);
                 return None;
             }
             if (lastdot >= PATH_MAX) {
@@ -320,7 +322,7 @@ static Box* getParent(Box* globals, int level, std::string& buf) {
             }
 
             buf = std::string(modname->s, 0, lastdot);
-            globals->setattr(package_str, boxStringPtr(&buf), NULL);
+            setGlobal(globals, package_str, boxStringPtr(&buf));
         }
     }
 
@@ -471,7 +473,6 @@ static bool loadNext(Box* mod, Box* altmod, std::string& name, std::string& buf,
 
 static void ensureFromlist(Box* module, Box* fromlist, std::string& buf, bool recursive);
 Box* importModuleLevel(const std::string& name, Box* globals, Box* from_imports, int level) {
-    assert(!globals || globals == None || isSubclass(globals->cls, module_cls));
     bool return_first = from_imports == None;
 
     static StatCounter slowpath_import("slowpath_import");
@@ -487,7 +488,7 @@ Box* importModuleLevel(const std::string& name, Box* globals, Box* from_imports,
     std::string _name = name;
 
     Box* head;
-    bool again = loadNext(parent, level < 0 ? NULL : parent, _name, buf, &head);
+    bool again = loadNext(parent, level < 0 ? None : parent, _name, buf, &head);
     if (head == NULL)
         return NULL;
 
@@ -589,7 +590,9 @@ extern "C" PyObject* PyImport_ImportModule(const char* name) noexcept {
     try {
         // TODO: check if this has the same behaviour as the cpython implementation
         std::string str = name;
-        return import(0, None, &str);
+        BoxedList* silly_list = new BoxedList();
+        listAppendInternal(silly_list, boxString("__doc__"));
+        return import(0, silly_list, &str);
     } catch (ExcInfo e) {
         setCAPIException(e);
         return NULL;
@@ -609,7 +612,7 @@ extern "C" PyObject* PyImport_AddModule(const char* name) noexcept {
 
         if (m != NULL && m->cls == module_cls)
             return m;
-        return createModule(name, name);
+        return createModule(name);
     } catch (ExcInfo e) {
         setCAPIException(e);
         return NULL;
@@ -625,9 +628,9 @@ extern "C" PyObject* PyImport_ExecCodeModuleEx(char* name, PyObject* co, char* p
         if (module == NULL)
             return NULL;
 
+        module->setattr("__file__", boxString(pathname), NULL);
         AST_Module* ast = parse_string(code->data());
         compileAndRunModule(ast, module);
-        module->setattr("__file__", boxString(pathname), NULL);
         return module;
     } catch (ExcInfo e) {
         removeModule(name);
@@ -663,7 +666,7 @@ Box* nullImporterFindModule(Box* self, Box* fullname, Box* path) {
 
 extern "C" Box* import(int level, Box* from_imports, const std::string* module_name) {
     std::string _module_name(*module_name);
-    return importModuleLevel(_module_name, getCurrentModule(), from_imports, level);
+    return importModuleLevel(_module_name, getGlobals(), from_imports, level);
 }
 
 Box* impFindModule(Box* _name, BoxedList* path) {
@@ -704,7 +707,6 @@ Box* impLoadModule(Box* _name, Box* _file, Box* _pathname, Box** args) {
     Box* _description = args[0];
 
     RELEASE_ASSERT(_name->cls == str_cls, "");
-    RELEASE_ASSERT(_file == None, "");
     RELEASE_ASSERT(_pathname->cls == str_cls, "");
     RELEASE_ASSERT(_description->cls == tuple_cls, "");
 
@@ -717,18 +719,32 @@ Box* impLoadModule(Box* _name, Box* _file, Box* _pathname, Box** args) {
     BoxedString* mode = (BoxedString*)description->elts[1];
     BoxedInt* type = (BoxedInt*)description->elts[2];
 
-    RELEASE_ASSERT(suffix->cls == str_cls, "");
     RELEASE_ASSERT(mode->cls == str_cls, "");
     RELEASE_ASSERT(type->cls == int_cls, "");
-
-    RELEASE_ASSERT(suffix->s.empty(), "");
-    RELEASE_ASSERT(mode->s.empty(), "");
+    RELEASE_ASSERT(pathname->cls == str_cls, "");
+    RELEASE_ASSERT(pathname->size(), "");
 
     if (type->n == SearchResult::PKG_DIRECTORY) {
+        RELEASE_ASSERT(suffix->cls == str_cls, "");
+        RELEASE_ASSERT(suffix->s.empty(), "");
+        RELEASE_ASSERT(mode->s.empty(), "");
+        RELEASE_ASSERT(_file == None, "");
         return createAndRunModule(name->s, (llvm::Twine(pathname->s) + "/__init__.py").str(), pathname->s);
+    } else if (type->n == SearchResult::PY_SOURCE) {
+        RELEASE_ASSERT(_file->cls == file_cls, "");
+        return createAndRunModule(name->s, pathname->s);
     }
 
     Py_FatalError("unimplemented");
+}
+
+Box* impLoadSource(Box* _name, Box* _pathname, Box* _file) {
+    RELEASE_ASSERT(!_file, "'file' argument not support yet");
+
+    RELEASE_ASSERT(_name->cls == str_cls, "");
+    RELEASE_ASSERT(_pathname->cls == str_cls, "");
+
+    return createAndRunModule(static_cast<BoxedString*>(_name)->s, static_cast<BoxedString*>(_pathname)->s);
 }
 
 Box* impLoadDynamic(Box* _name, Box* _pathname, Box* _file) {
@@ -771,10 +787,38 @@ Box* impReleaseLock() {
     return None;
 }
 
+Box* impNewModule(Box* _name) {
+    if (!PyString_Check(_name))
+        raiseExcHelper(TypeError, "must be string, not %s", getTypeName(_name));
+
+    BoxedModule* module = new BoxedModule();
+    moduleInit(module, _name);
+    return module;
+}
+
+Box* impIsBuiltin(Box* _name) {
+    if (!PyString_Check(_name))
+        raiseExcHelper(TypeError, "must be string, not %s", getTypeName(_name));
+
+    BoxedTuple* builtin_modules = (BoxedTuple*)sys_module->getattr("builtin_module_names");
+    RELEASE_ASSERT(PyTuple_Check(builtin_modules), "");
+    for (Box* m : builtin_modules->pyElements()) {
+        if (compare(m, _name, AST_TYPE::Eq) == True)
+            return boxInt(-1); // CPython returns 1 for modules which can get reinitialized.
+    }
+    return boxInt(0);
+}
+
+Box* impIsFrozen(Box* name) {
+    if (!PyString_Check(name))
+        raiseExcHelper(TypeError, "must be string, not %s", getTypeName(name));
+    return False;
+}
+
 void setupImport() {
     BoxedModule* imp_module
-        = createModule("imp", "__builtin__", "'This module provides the components needed to build your own\n"
-                                             "__import__ function.  Undocumented functions are obsolete.'");
+        = createModule("imp", NULL, "'This module provides the components needed to build your own\n"
+                                    "__import__ function.  Undocumented functions are obsolete.'");
 
     imp_module->giveAttr("PY_SOURCE", boxInt(SearchResult::PY_SOURCE));
     imp_module->giveAttr("PY_COMPILED", boxInt(SearchResult::PY_COMPILED));
@@ -800,6 +844,9 @@ void setupImport() {
     CLFunction* load_module_func = boxRTFunction((void*)impLoadModule, UNKNOWN, 4,
                                                  ParamNames({ "name", "file", "pathname", "description" }, "", ""));
     imp_module->giveAttr("load_module", new BoxedBuiltinFunctionOrMethod(load_module_func, "load_module"));
+    imp_module->giveAttr(
+        "load_source", new BoxedBuiltinFunctionOrMethod(
+                           boxRTFunction((void*)impLoadSource, UNKNOWN, 3, 1, false, false), "load_source", { NULL }));
 
     CLFunction* load_dynamic_func = boxRTFunction((void*)impLoadDynamic, UNKNOWN, 3, 1, false, false,
                                                   ParamNames({ "name", "pathname", "file" }, "", ""));
@@ -811,5 +858,12 @@ void setupImport() {
                                                                           "acquire_lock"));
     imp_module->giveAttr("release_lock", new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)impReleaseLock, NONE, 0),
                                                                           "release_lock"));
+
+    imp_module->giveAttr("new_module",
+                         new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)impNewModule, MODULE, 1), "new_module"));
+    imp_module->giveAttr(
+        "is_builtin", new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)impIsBuiltin, BOXED_INT, 1), "is_builtin"));
+    imp_module->giveAttr(
+        "is_frozen", new BoxedBuiltinFunctionOrMethod(boxRTFunction((void*)impIsFrozen, BOXED_BOOL, 1), "is_frozen"));
 }
 }

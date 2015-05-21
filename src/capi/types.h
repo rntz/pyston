@@ -16,6 +16,7 @@
 #define PYSTON_CAPI_TYPES_H
 
 #include "runtime/capi.h"
+#include "runtime/objmodel.h"
 #include "runtime/types.h"
 
 namespace pyston {
@@ -33,7 +34,7 @@ struct wrapper_def {
     // exists in CPython: PyObject *name_strobj
 };
 
-extern BoxedClass* capifunc_cls, *wrapperdescr_cls, *wrapperobject_cls;
+extern "C" BoxedClass* capifunc_cls, *wrapperdescr_cls, *wrapperobject_cls;
 
 class BoxedCApiFunction : public Box {
 private:
@@ -43,8 +44,11 @@ private:
     PyCFunction func;
 
 public:
-    BoxedCApiFunction(int ml_flags, Box* passthrough, const char* name, PyCFunction func)
-        : ml_flags(ml_flags), passthrough(passthrough), name(name), func(func) {}
+    Box* module;
+
+public:
+    BoxedCApiFunction(int ml_flags, Box* passthrough, const char* name, PyCFunction func, Box* module = NULL)
+        : ml_flags(ml_flags), passthrough(passthrough), name(name), func(func), module(module) {}
 
     DEFAULT_CLASS(capifunc_cls);
 
@@ -54,6 +58,7 @@ public:
     }
 
     static Box* __call__(BoxedCApiFunction* self, BoxedTuple* varargs, BoxedDict* kwargs) {
+        STAT_TIMER(t0, "us_timer_boxedcapifunction__call__");
         assert(self->cls == capifunc_cls);
         assert(varargs->cls == tuple_cls);
         assert(kwargs->cls == dict_cls);
@@ -71,9 +76,26 @@ public:
             assert(varargs->size() == 0);
             rtn = (Box*)self->func(self->passthrough, NULL);
         } else if (self->ml_flags == METH_O) {
-            assert(kwargs->d.size() == 0);
-            assert(varargs->size() == 1);
+            if (kwargs->d.size() != 0) {
+                raiseExcHelper(TypeError, "%s() takes no keyword arguments", self->name);
+            }
+            if (varargs->size() != 1) {
+                raiseExcHelper(TypeError, "%s() takes exactly one argument (%d given)", self->name, varargs->size());
+            }
             rtn = (Box*)self->func(self->passthrough, varargs->elts[0]);
+        } else if (self->ml_flags == METH_OLDARGS) {
+            /* the really old style */
+            if (kwargs == NULL || PyDict_Size(kwargs) == 0) {
+                int size = PyTuple_GET_SIZE(varargs);
+                Box* arg = varargs;
+                if (size == 1)
+                    arg = PyTuple_GET_ITEM(varargs, 0);
+                else if (size == 0)
+                    arg = NULL;
+                rtn = self->func(self->passthrough, arg);
+            } else {
+                raiseExcHelper(TypeError, "%.200s() takes no keyword arguments", self->name);
+            }
         } else {
             RELEASE_ASSERT(0, "0x%x", self->ml_flags);
         }
@@ -83,8 +105,25 @@ public:
         return rtn;
     }
 
+    static Box* getname(Box* b, void*) {
+        RELEASE_ASSERT(b->cls == capifunc_cls, "");
+        const char* s = static_cast<BoxedCApiFunction*>(b)->name;
+        if (s)
+            return boxStrConstant(s);
+        return None;
+    }
+
     static Box* callInternal(BoxedFunctionBase* func, CallRewriteArgs* rewrite_args, ArgPassSpec argspec, Box* arg1,
                              Box* arg2, Box* arg3, Box** args, const std::vector<const std::string*>* keyword_names);
+
+    static void gcHandler(GCVisitor* v, Box* _o) {
+        assert(_o->cls == capifunc_cls);
+        BoxedCApiFunction* o = static_cast<BoxedCApiFunction*>(_o);
+
+        boxGCHandler(v, o);
+        v->visit(o->passthrough);
+        v->visit(o->module);
+    }
 };
 
 class BoxedWrapperDescriptor : public Box {
@@ -99,6 +138,14 @@ public:
 
     static Box* __get__(BoxedWrapperDescriptor* self, Box* inst, Box* owner);
     static Box* __call__(BoxedWrapperDescriptor* descr, PyObject* self, BoxedTuple* args, Box** _args);
+
+    static void gcHandler(GCVisitor* v, Box* _o) {
+        assert(_o->cls == wrapperdescr_cls);
+        BoxedWrapperDescriptor* o = static_cast<BoxedWrapperDescriptor*>(_o);
+
+        boxGCHandler(v, o);
+        v->visit(o->type);
+    }
 };
 
 class BoxedWrapperObject : public Box {
@@ -111,6 +158,8 @@ public:
     DEFAULT_CLASS(wrapperobject_cls);
 
     static Box* __call__(BoxedWrapperObject* self, Box* args, Box* kwds) {
+        STAT_TIMER(t0, "us_timer_boxedwrapperobject__call__");
+
         assert(self->cls == wrapperobject_cls);
         assert(args->cls == tuple_cls);
         assert(kwds->cls == dict_cls);
@@ -123,7 +172,7 @@ public:
         if (flags == PyWrapperFlag_KEYWORDS) {
             wrapperfunc_kwds wk = (wrapperfunc_kwds)wrapper;
             rtn = (*wk)(self->obj, args, self->descr->wrapped, kwds);
-        } else if (flags == 0) {
+        } else if (flags == PyWrapperFlag_PYSTON || flags == 0) {
             rtn = (*wrapper)(self->obj, args, self->descr->wrapped);
         } else {
             RELEASE_ASSERT(0, "%d", flags);
@@ -132,6 +181,14 @@ public:
         checkAndThrowCAPIException();
         assert(rtn && "should have set + thrown an exception!");
         return rtn;
+    }
+
+    static void gcHandler(GCVisitor* v, Box* _o) {
+        assert(_o->cls == wrapperobject_cls);
+        BoxedWrapperObject* o = static_cast<BoxedWrapperObject*>(_o);
+
+        boxGCHandler(v, o);
+        v->visit(o->obj);
     }
 };
 
@@ -150,7 +207,7 @@ public:
         // CPython handles this differently: they create the equivalent of different BoxedMethodDescriptor
         // objects but with different class objects, which define different __get__ and __call__ methods.
         if (self->method->ml_flags & METH_CLASS)
-            return boxInstanceMethod(owner, self);
+            return boxInstanceMethod(owner, self, self->type);
 
         if (self->method->ml_flags & METH_STATIC)
             Py_FatalError("unimplemented");
@@ -160,10 +217,18 @@ public:
         if (inst == None)
             return self;
         else
-            return boxInstanceMethod(inst, self);
+            return boxInstanceMethod(inst, self, self->type);
     }
 
     static Box* __call__(BoxedMethodDescriptor* self, Box* obj, BoxedTuple* varargs, Box** _args);
+
+    static void gcHandler(GCVisitor* v, Box* _o) {
+        assert(_o->cls == method_cls);
+        BoxedMethodDescriptor* o = static_cast<BoxedMethodDescriptor*>(_o);
+
+        boxGCHandler(v, o);
+        v->visit(o->type);
+    }
 };
 
 } // namespace pyston

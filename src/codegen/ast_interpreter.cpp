@@ -88,7 +88,6 @@ private:
     Value doBinOp(Box* left, Box* right, int op, BinExpType exp_type);
     void doStore(AST_expr* node, Value value);
     void doStore(InternedString name, Value value);
-    void eraseDeadSymbols();
 
     Value visit_assert(AST_Assert* node);
     Value visit_assign(AST_Assign* node);
@@ -212,6 +211,7 @@ void ASTInterpreter::setFrameInfo(const FrameInfo* frame_info) {
 }
 
 void ASTInterpreter::setGlobals(Box* globals) {
+    assert(gc::isValidGCObject(globals));
     this->globals = globals;
 }
 
@@ -229,9 +229,18 @@ void ASTInterpreter::gcVisit(GCVisitor* visitor) {
 }
 
 ASTInterpreter::ASTInterpreter(CompiledFunction* compiled_function)
-    : compiled_func(compiled_function), source_info(compiled_function->clfunc->source.get()), scope_info(0), phis(NULL),
-      current_block(0), current_inst(0), last_exception(NULL, NULL, NULL), passed_closure(0), created_closure(0),
-      generator(0), edgecount(0), frame_info(ExcInfo(NULL, NULL, NULL)) {
+    : compiled_func(compiled_function),
+      source_info(compiled_function->clfunc->source.get()),
+      scope_info(0),
+      phis(NULL),
+      current_block(0),
+      current_inst(0),
+      last_exception(NULL, NULL, NULL),
+      passed_closure(0),
+      created_closure(0),
+      generator(0),
+      edgecount(0),
+      frame_info(ExcInfo(NULL, NULL, NULL)) {
 
     CLFunction* f = compiled_function->clfunc;
     if (!source_info->cfg)
@@ -293,6 +302,8 @@ public:
 Value ASTInterpreter::execute(ASTInterpreter& interpreter, CFGBlock* start_block, AST_stmt* start_at) {
     threading::allowGLReadPreemption();
 
+    STAT_TIMER(t0, "us_timer_astinterpreter_execute");
+
     void* frame_addr = __builtin_frame_address(0);
     RegisterHelper frame_registerer(&interpreter, frame_addr);
 
@@ -329,31 +340,6 @@ Value ASTInterpreter::execute(ASTInterpreter& interpreter, CFGBlock* start_block
     return v;
 }
 
-void ASTInterpreter::eraseDeadSymbols() {
-    if (source_info->liveness == NULL)
-        source_info->liveness = computeLivenessInfo(source_info->cfg);
-
-    if (this->phis == NULL) {
-        PhiAnalysis*& phis = source_info->phis[/* entry_descriptor = */ NULL];
-        if (!phis)
-            phis = computeRequiredPhis(compiled_func->clfunc->param_names, source_info->cfg, source_info->liveness,
-                                       scope_info);
-        this->phis = phis;
-    }
-
-    std::vector<InternedString> dead_symbols;
-    for (auto& it : sym_table) {
-        if (!source_info->liveness->isLiveAtEnd(it.first, current_block)) {
-            dead_symbols.push_back(it.first);
-        } else if (phis->isRequiredAfter(it.first, current_block)) {
-            assert(scope_info->getScopeTypeOfName(it.first) != ScopeInfo::VarScopeType::GLOBAL);
-        } else {
-        }
-    }
-    for (auto&& dead : dead_symbols)
-        sym_table.erase(dead);
-}
-
 Value ASTInterpreter::doBinOp(Box* left, Box* right, int op, BinExpType exp_type) {
     if (op == AST_TYPE::Div && (source_info->parent_module->future_flags & FF_DIVISION)) {
         op = AST_TYPE::TrueDiv;
@@ -374,12 +360,7 @@ Value ASTInterpreter::doBinOp(Box* left, Box* right, int op, BinExpType exp_type
 void ASTInterpreter::doStore(InternedString name, Value value) {
     ScopeInfo::VarScopeType vst = scope_info->getScopeTypeOfName(name);
     if (vst == ScopeInfo::VarScopeType::GLOBAL) {
-        if (globals->cls == module_cls) {
-            setattr(static_cast<BoxedModule*>(globals), name.c_str(), value.o);
-        } else {
-            assert(globals->cls == dict_cls);
-            static_cast<BoxedDict*>(globals)->d[boxString(name.str())] = value.o;
-        }
+        setGlobal(globals, name, value.o);
     } else if (vst == ScopeInfo::VarScopeType::NAME) {
         assert(frame_info.boxedLocals != NULL);
         // TODO should probably pre-box the names when it's a scope that usesNameLookup
@@ -468,10 +449,29 @@ Value ASTInterpreter::visit_jump(AST_Jump* node) {
     if (backedge)
         threading::allowGLReadPreemption();
 
-    if (ENABLE_OSR && backedge && (globals->cls == module_cls)) {
-        bool can_osr = !FORCE_INTERPRETER && (globals->cls == module_cls);
-        if (can_osr && edgecount++ > OSR_THRESHOLD_INTERPRETER) {
-            eraseDeadSymbols();
+    if (ENABLE_OSR && backedge && edgecount++ == OSR_THRESHOLD_INTERPRETER) {
+        bool can_osr = !FORCE_INTERPRETER && source_info->scoping->areGlobalsFromModule();
+        if (can_osr) {
+            static StatCounter ast_osrs("num_ast_osrs");
+            ast_osrs.log();
+
+            // TODO: we will immediately want the liveness info again in the jit, we should pass
+            // it through.
+            std::unique_ptr<LivenessAnalysis> liveness = computeLivenessInfo(source_info->cfg);
+            std::unique_ptr<PhiAnalysis> phis
+                = computeRequiredPhis(compiled_func->clfunc->param_names, source_info->cfg, liveness.get(), scope_info);
+
+            std::vector<InternedString> dead_symbols;
+            for (auto& it : sym_table) {
+                if (!liveness->isLiveAtEnd(it.first, current_block)) {
+                    dead_symbols.push_back(it.first);
+                } else if (phis->isRequiredAfter(it.first, current_block)) {
+                    assert(scope_info->getScopeTypeOfName(it.first) != ScopeInfo::VarScopeType::GLOBAL);
+                } else {
+                }
+            }
+            for (auto&& dead : dead_symbols)
+                sym_table.erase(dead);
 
             const OSREntryDescriptor* found_entry = nullptr;
             for (auto& p : compiled_func->clfunc->osr_versions) {
@@ -487,7 +487,7 @@ Value ASTInterpreter::visit_jump(AST_Jump* node) {
 
             for (auto& name : phis->definedness.getDefinedNamesAtEnd(current_block)) {
                 auto it = sym_table.find(name);
-                if (!source_info->liveness->isLiveAtEnd(name, current_block))
+                if (!liveness->isLiveAtEnd(name, current_block))
                     continue;
 
                 if (phis->isPotentiallyUndefinedAfter(name, current_block)) {
@@ -501,6 +501,19 @@ Value ASTInterpreter::visit_jump(AST_Jump* node) {
                     ASSERT(it != sym_table.end(), "%s", name.c_str());
                     sorted_symbol_table[it->first] = sym_table.getMapped(it->second);
                 }
+            }
+
+            // Manually free these here, since we might not return from this scope for a long time.
+            liveness.reset(nullptr);
+            phis.reset(nullptr);
+
+            // LLVM has a limit on the number of operands a machine instruction can have (~255),
+            // in order to not hit the limit with the patchpoints cancel OSR when we have a high number of symbols.
+            if (sorted_symbol_table.size() > 225) {
+                static StatCounter times_osr_cancel("num_osr_cancel_too_many_syms");
+                times_osr_cancel.log();
+                next_block = node->target;
+                return Value();
             }
 
             if (generator)
@@ -542,6 +555,7 @@ Value ASTInterpreter::visit_jump(AST_Jump* node) {
                 arg_array.push_back(it.second);
             }
 
+            STAT_TIMER(t0, "us_timer_astinterpreter_jump_osrexit");
             CompiledFunction* partial_func = compilePartialFuncInternal(&exit);
             auto arg_tuple = getTupleFromArgsArray(&arg_array[0], arg_array.size());
             Box* r = partial_func->call(std::get<0>(arg_tuple), std::get<1>(arg_tuple), std::get<2>(arg_tuple),
@@ -622,9 +636,7 @@ Value ASTInterpreter::visit_langPrimitive(AST_LangPrimitive* node) {
 
         Value module = visit_expr(node->args[0]);
 
-        RELEASE_ASSERT(globals == source_info->parent_module,
-                       "'import *' currently not supported with overridden globals");
-        v = importStar(module.o, source_info->parent_module);
+        v = importStar(module.o, globals);
     } else if (node->opcode == AST_LangPrimitive::NONE) {
         v = None;
     } else if (node->opcode == AST_LangPrimitive::LANDINGPAD) {
@@ -763,8 +775,6 @@ Box* ASTInterpreter::createFunction(AST* node, AST_arguments* args, const std::v
         takes_closure = source_info->scoping->getScopeInfoForNode(node)->takesClosure();
     }
 
-    bool is_generator = cl->source->is_generator;
-
     BoxedClosure* closure = 0;
     if (takes_closure) {
         if (scope_info->createsClosure()) {
@@ -779,7 +789,7 @@ Box* ASTInterpreter::createFunction(AST* node, AST_arguments* args, const std::v
     Box* passed_globals = NULL;
     if (!getCF()->clfunc->source->scoping->areGlobalsFromModule())
         passed_globals = globals;
-    return boxCLFunction(cl, closure, is_generator, passed_globals, u.il);
+    return boxCLFunction(cl, closure, passed_globals, u.il);
 }
 
 Value ASTInterpreter::visit_makeFunction(AST_MakeFunction* mkfn) {
@@ -813,13 +823,20 @@ Value ASTInterpreter::visit_makeClass(AST_MakeClass* mkclass) {
     for (AST_expr* d : node->decorator_list)
         decorators.push_back(visit_expr(d).o);
 
-    BoxedClosure* closure = scope_info->takesClosure() ? created_closure : 0;
+    BoxedClosure* closure = NULL;
+    if (scope_info->takesClosure()) {
+        if (this->scope_info->passesThroughClosure())
+            closure = passed_closure;
+        else
+            closure = created_closure;
+        assert(closure);
+    }
     CLFunction* cl = wrapFunction(node, nullptr, node->body, source_info);
 
     Box* passed_globals = NULL;
     if (!getCF()->clfunc->source->scoping->areGlobalsFromModule())
         passed_globals = globals;
-    Box* attrDict = runtimeCall(boxCLFunction(cl, closure, false, passed_globals, {}), ArgPassSpec(0), 0, 0, 0, 0, 0);
+    Box* attrDict = runtimeCall(boxCLFunction(cl, closure, passed_globals, {}), ArgPassSpec(0), 0, 0, 0, 0, 0);
 
     Box* classobj = createUserClass(&node->name.str(), basesTuple, attrDict);
 
@@ -847,7 +864,10 @@ Value ASTInterpreter::visit_assert(AST_Assert* node) {
     Value v = visit_expr(node->test);
     assert(v.o->cls == int_cls && static_cast<BoxedInt*>(v.o)->n == 0);
 #endif
-    assertFail(source_info->parent_module, node->msg ? visit_expr(node->msg).o : 0);
+
+    static std::string AssertionError_str("AssertionError");
+    Box* assertion_type = getGlobal(globals, &AssertionError_str);
+    assertFail(assertion_type, node->msg ? visit_expr(node->msg).o : 0);
 
     return Value();
 }
@@ -878,7 +898,6 @@ Value ASTInterpreter::visit_delete(AST_Delete* node) {
 
                 ScopeInfo::VarScopeType vst = scope_info->getScopeTypeOfName(target->id);
                 if (vst == ScopeInfo::VarScopeType::GLOBAL) {
-                    // Can't use delattr since the errors are different:
                     delGlobal(globals, &target->id.str());
                     continue;
                 } else if (vst == ScopeInfo::VarScopeType::NAME) {
@@ -928,6 +947,8 @@ Value ASTInterpreter::visit_print(AST_Print* node) {
     static const std::string write_str("write");
     static const std::string newline_str("\n");
     static const std::string space_str(" ");
+
+    STAT_TIMER(t0, "us_timer_visit_print");
 
     Box* dest = node->dest ? visit_expr(node->dest).o : getSysStdout();
     int nvals = node->values.size();
